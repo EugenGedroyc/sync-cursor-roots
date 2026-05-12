@@ -13,7 +13,9 @@
 #   sync-cursor-rules.sh [options]
 #
 # Options:
-#   --dry-run              Print actions only
+#   --dry-run              Print planned actions only; no copies or git writes.
+#                          When mtimes tie within --tie-sec but content differs,
+#                          prints [dry-run] conflict lines and skips (no prompt).
 #   --commit-push          After sync, git add/commit/push (rules/, agents/, .gitignore, .gitattributes)
 #   -m, --message TEXT     Commit message (default: auto)
 #   --wsl-root PATH        Default: $CURSOR_WSL_ROOT or $HOME/.cursor
@@ -37,7 +39,7 @@ WIN_ROOT="${CURSOR_WIN_ROOT:-$HOME/winhome/.cursor}"
 die() { echo "error: $*" >&2; exit 1; }
 
 usage() {
-  sed -n '2,35p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,/^[^#]/p' "$0" | sed '/^[^#]/d' | sed 's/^# \{0,1\}//'
 }
 
 while [[ $# -gt 0 ]]; do
@@ -278,6 +280,15 @@ sync_one() {
     else
       copy_file "$win_f" "$wsl_f" "Windows newer -> WSL ($rel)"
     fi
+    return 0
+  fi
+
+  if [[ $DRY_RUN -eq 1 ]]; then
+    echo "[dry-run] conflict (mtime tie within --tie-sec, content differs): $rel" >&2
+    echo "[dry-run]   WSL:      $wsl_f" >&2
+    echo "[dry-run]   Windows:  $win_f" >&2
+    echo "[dry-run]   Would prompt (keep WSL / keep Windows / skip); skipping - leaving both files unchanged." >&2
+    echo "[dry-run]   Hint: run without --dry-run to choose, or adjust mtimes / use --tie-sec so the newer side wins." >&2
     return 0
   fi
 
