@@ -75,8 +75,13 @@ load_sync_env_file() {
   # shellcheck disable=SC1090
   source "$env_path"
   set +a
-  [[ -n "$_pre_1_to_2" ]] && SYNC_IGNORE_1_TO_2="$_pre_1_to_2"
-  [[ -n "$_pre_2_to_1" ]] && SYNC_IGNORE_2_TO_1="$_pre_2_to_1"
+  # Use if/fi (not &&) so the last statement is never a failing [[ under set -e.
+  if [[ -n "$_pre_1_to_2" ]]; then
+    SYNC_IGNORE_1_TO_2="$_pre_1_to_2"
+  fi
+  if [[ -n "$_pre_2_to_1" ]]; then
+    SYNC_IGNORE_2_TO_1="$_pre_2_to_1"
+  fi
 }
 
 load_sync_env_file
@@ -508,6 +513,18 @@ collect_relpaths() {
   done
 }
 
+echo "Cursor root 1: $ROOT1"
+[[ "$ROOT1_CFG" != "$ROOT1" ]] && echo "  (from $ROOT1_CFG)"
+echo "Cursor root 2: $ROOT2"
+[[ "$ROOT2_CFG" != "$ROOT2" ]] && echo "  (from $ROOT2_CFG)"
+echo "Scope:        rules/ agents/ skills/"
+[[ $NORMALIZE_LF -eq 1 ]] && echo "Normalize:    LF strip on copy for .md/.mdc/.json/.yaml/.txt"
+[[ $DRY_RUN -eq 1 ]] && echo "Mode:         dry-run"
+maybe_warn_drvfs "$ROOT1" "root 1"
+maybe_warn_drvfs "$ROOT2" "root 2"
+echo "Scanning both roots for files under rules/, agents/, skills/ ..."
+echo
+
 declare -A SEEN_PATHS
 PATHS=()
 
@@ -535,6 +552,8 @@ PATHS_SORTED=()
 if ((${#PATHS[@]})); then
   mapfile -t PATHS_SORTED < <(printf '%s\n' "${PATHS[@]}" | sort -u)
 fi
+echo "Indexed ${#PATHS_SORTED[@]} file path(s) under scope."
+echo
 
 build_sync_ignore_maps
 
@@ -739,17 +758,6 @@ sync_one() {
     copy_file "$root2_f" "$root1_f" "resolved root 2 -> root 1 ($rel)"
   fi
 }
-
-echo "Cursor root 1: $ROOT1"
-[[ "$ROOT1_CFG" != "$ROOT1" ]] && echo "  (from $ROOT1_CFG)"
-echo "Cursor root 2: $ROOT2"
-[[ "$ROOT2_CFG" != "$ROOT2" ]] && echo "  (from $ROOT2_CFG)"
-echo "Scope:        rules/ agents/ skills/"
-[[ $NORMALIZE_LF -eq 1 ]] && echo "Normalize:    LF strip on copy for .md/.mdc/.json/.yaml/.txt"
-[[ $DRY_RUN -eq 1 ]] && echo "Mode:         dry-run"
-maybe_warn_drvfs "$ROOT1" "root 1"
-maybe_warn_drvfs "$ROOT2" "root 2"
-echo
 
 ensure_pre_sync_consent_if_needed
 
