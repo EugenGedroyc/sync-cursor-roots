@@ -1,10 +1,10 @@
 # sync-cursor-rules
 
-Bash script that copies `rules/` and `agents/` between two `.cursor` directories (for example WSL `~/.cursor` and a Windows mount). When the same file exists on both sides and the bytes differ, it picks the newer file by modification time. Equal times within `--tie-sec` open an interactive pick.
+Bash script that copies `rules/`, `agents/`, and `skills/` between two `.cursor` directories (for example WSL `~/.cursor` and a Windows mount). When the same file exists on both sides and the bytes differ, it picks the newer file by modification time. Equal times within `--tie-sec` open an interactive pick.
 
 ## Git and `--commit-push`
 
-`--commit-push` only makes sense when each root is already a git checkout (or contains one). The script `cd`s to the root path you pass, stages `rules/`, `agents/`, `.gitignore`, and `.gitattributes`, then commits and pushes. If there is no `.git` there, it prints a skip message and moves on.
+`--commit-push` only makes sense when each root is already a git checkout (or contains one). The script `cd`s to the root path you pass, stages `rules/`, `agents/`, `skills/`, `.gitignore`, and `.gitattributes`, then commits and pushes. If there is no `.git` there, it prints a skip message and moves on.
 
 ## Quick start
 

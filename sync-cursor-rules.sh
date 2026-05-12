@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Sync Cursor rules/ and agents/ between two .cursor roots (e.g. WSL vs Windows mount).
+# Sync Cursor rules/, agents/, and skills/ between two .cursor roots (e.g. WSL vs Windows mount).
 # Uses newer mtime when content differs; prompts when mtimes tie (or with --tie-sec).
 #
 # Cross-filesystem / line endings (QA):
@@ -14,7 +14,7 @@
 #
 # Assumptions:
 #   Each .cursor root should live inside a git repo if you use --commit-push.
-#   The script runs git add/commit/push from that root for rules/, agents/,
+#   The script runs git add/commit/push from that root for rules/, agents/, skills/,
 #   .gitignore, and .gitattributes. Roots without .git are skipped for git.
 #
 # Options:
@@ -26,8 +26,8 @@
 #                              before git commit/push. Does not change conflict resolution:
 #                              mtime ties with differing content still use the interactive
 #                              menu unless --dry-run (which skips those conflicts).
-#   --commit-push              After sync, git add/commit/push (rules/, agents/, gitignore,
-#                              gitattributes). When not --dry-run, prompts before commit/push
+#   --commit-push              After sync, git add/commit/push (rules/, agents/, skills/,
+#                              gitignore, gitattributes). When not --dry-run, prompts before commit/push
 #                              unless -y/--yes.
 #   -m, --message TEXT         Commit message (default: auto)
 #   --wsl-root PATH            Default: $CURSOR_WSL_ROOT or $HOME/.cursor
@@ -56,6 +56,8 @@ WIN_ROOT="${CURSOR_WIN_ROOT:-$HOME/winhome/.cursor}"
 # Set to 1 after the first successful mutating-sync confirmation (copies / LF-normalize to both).
 SYNC_WRITE_CONSENTED=0
 SKIP_GIT_COMMIT_PUSH=0
+# Basenames under each .cursor root to scan for files and to stage on --commit-push.
+SYNC_SUBDIRS=(rules agents skills)
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -373,7 +375,7 @@ should_normalize_lf() {
 collect_relpaths() {
   local root="$1"
   local sub
-  for sub in rules agents; do
+  for sub in "${SYNC_SUBDIRS[@]}"; do
     if [[ -d "$root/$sub" ]]; then
       find "$root/$sub" -type f -print0 2>/dev/null
     fi
@@ -554,7 +556,7 @@ echo "WSL root:     $WSL_ROOT"
 [[ "$WSL_CFG" != "$WSL_ROOT" ]] && echo "  (from $WSL_CFG)"
 echo "Windows root: $WIN_ROOT"
 [[ "$WIN_CFG" != "$WIN_ROOT" ]] && echo "  (from $WIN_CFG)"
-echo "Scope:        rules/ agents/"
+echo "Scope:        rules/ agents/ skills/"
 [[ $NORMALIZE_LF -eq 1 ]] && echo "Normalize:    LF strip on copy for .md/.mdc/.json/.yaml/.txt"
 [[ $DRY_RUN -eq 1 ]] && echo "Mode:         dry-run"
 maybe_warn_drvfs "$WSL_ROOT" "WSL"
@@ -591,9 +593,9 @@ git_preview_staged_diffs() {
           git add -- "$f"
         fi
       done
-      for sub in rules agents; do
+      for sub in "${SYNC_SUBDIRS[@]}"; do
         if [[ -d "$sub" ]]; then
-          if [[ "$sub" == agents ]]; then
+          if [[ "$sub" == agents || "$sub" == skills ]]; then
             git add -f -- "$sub"
           else
             git add -- "$sub"
@@ -601,12 +603,12 @@ git_preview_staged_diffs() {
         fi
       done
       if git diff --cached --quiet; then
-        echo "=== git preview ($name): nothing staged after add (rules, agents, gitignore/attributes) ==="
+        echo "=== git preview ($name): nothing staged after add (rules, agents, skills, gitignore/attributes) ==="
       else
         echo "=== git preview ($name): git diff --cached (same paths as commit) ==="
         git diff --cached || true
       fi
-      git reset HEAD -- .gitignore .gitattributes rules agents 2>/dev/null || true
+      git reset HEAD -- .gitignore .gitattributes "${SYNC_SUBDIRS[@]}" 2>/dev/null || true
     )
     echo
   done
@@ -630,10 +632,10 @@ git_commit_push_one() {
       fi
     done
     local sub
-    for sub in rules agents; do
+    for sub in "${SYNC_SUBDIRS[@]}"; do
       if [[ -d "$sub" ]]; then
-        # agents/ must stay tracked even if the managed .gitignore block drops !agents/ on disk
-        if [[ "$sub" == agents ]]; then
+        # agents/ and skills/ may be ignored by a managed .gitignore; -f keeps them staged.
+        if [[ "$sub" == agents || "$sub" == skills ]]; then
           git add -f -- "$sub"
         else
           git add -- "$sub"
@@ -641,12 +643,12 @@ git_commit_push_one() {
       fi
     done
     if git diff --cached --quiet; then
-      echo "git ($name): nothing to commit (rules, agents, gitignore/attributes)"
+      echo "git ($name): nothing to commit (rules, agents, skills, gitignore/attributes)"
       exit 0
     fi
     local msg="$COMMIT_MSG"
     if [[ -z "$msg" ]]; then
-      msg="chore(cursor): sync rules and agents"
+      msg="chore(cursor): sync rules, agents, and skills"
     fi
     if [[ $DRY_RUN -eq 1 ]]; then
       echo "[dry-run] git ($name): would commit and push with message: $msg"
@@ -678,7 +680,7 @@ fi
 
 if [[ $COMMIT_PUSH -eq 1 ]] && [[ $SKIP_GIT_COMMIT_PUSH -eq 0 ]]; then
   echo
-  echo "=== git commit/push (rules, agents, gitignore/attributes) ==="
+  echo "=== git commit/push (rules, agents, skills, gitignore/attributes) ==="
   git_commit_push_one "$WSL_ROOT" "WSL" || true
   git_commit_push_one "$WIN_ROOT" "Windows" || true
 fi
