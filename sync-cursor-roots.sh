@@ -201,7 +201,10 @@ dry_run_skip_ignore() {
 # Non-dry: align with --verbose skips (e.g. EOL-only).
 skip_ignore_msg() {
   local tag="$1" rel="$2"
-  [[ $VERBOSE -eq 1 ]] && printf 'skip (ignored %s): %s\n' "$tag" "$rel" >&2
+  if [[ $VERBOSE -eq 1 ]]; then
+    printf 'skip (ignored %s): %s\n' "$tag" "$rel" >&2
+  fi
+  return 0
 }
 
 normalize_src_for_pair() {
