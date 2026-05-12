@@ -18,22 +18,29 @@
 #   .gitignore, and .gitattributes. Roots without .git are skipped for git.
 #
 # Options:
-#   --dry-run              Print planned actions only; no copies or git writes.
-#                          No interactive prompts. When mtimes tie within --tie-sec
-#                          but content differs, prints [dry-run] conflict lines and skips (no prompt).
-#   -y, --yes              Skip interactive confirmations before mutating sync writes
-#                          and before git commit/push. Does not change conflict resolution:
-#                          mtime ties with differing content still use the interactive menu
-#                          unless --dry-run (which skips those conflicts).
-#   --commit-push          After sync, git add/commit/push (rules/, agents/, .gitignore, .gitattributes).
-#                          When not --dry-run, prompts before commit/push unless -y/--yes.
-#   -m, --message TEXT     Commit message (default: auto)
-#   --wsl-root PATH        Default: $CURSOR_WSL_ROOT or $HOME/.cursor
-#   --win-root PATH        Default: $CURSOR_WIN_ROOT or $HOME/winhome/.cursor
-#   --tie-sec N            If |mtime_a-mtime_b| <= N and content differs, prompt (default: 0)
-#   --normalize-lf        When copying, strip CR for common text extensions (see script)
-#   --verbose               Log skips for CRLF-only differences
-#   -h, --help             Show help
+#   --dry-run                  Print planned actions only; no copies or git writes.
+#                              No interactive prompts. When mtimes tie within --tie-sec
+#                              but content differs, prints [dry-run] conflict lines and
+#                              skips (no prompt).
+#   -y, --yes                  Skip interactive confirmations before mutating sync and
+#                              before git commit/push. Does not change conflict resolution:
+#                              mtime ties with differing content still use the interactive
+#                              menu unless --dry-run (which skips those conflicts).
+#   --commit-push              After sync, git add/commit/push (rules/, agents/, gitignore,
+#                              gitattributes). When not --dry-run, prompts before commit/push
+#                              unless -y/--yes.
+#   -m, --message TEXT         Commit message (default: auto)
+#   --wsl-root PATH            Default: $CURSOR_WSL_ROOT or $HOME/.cursor
+#   --win-root PATH            Default: $CURSOR_WIN_ROOT or $HOME/winhome/.cursor
+#   --tie-sec N                If |mtime_a-mtime_b| <= N and content differs, prompt (default: 0)
+#   --normalize-lf             When copying, strip CR for common text extensions (see script)
+#   --verbose                  Log skips for CRLF-only differences
+#   -h, --help                 Show help
+#
+# Interactive prompts (tty; use -y/--yes if unavailable):
+#   Do you want to continue? [Y/n/d] — before mutating sync (impact summary first).
+#   Y / empty / yes: proceed; n / no: exit 0; d: full unified diffs, then re-prompt.
+#   Proceed with git commit and push? [Y/n/d] — same; d runs a per-root staged diff preview.
 
 set -euo pipefail
 
@@ -67,6 +74,199 @@ confirm_default_yes() {
       *) printf 'Please answer y or n (default yes).\n' >/dev/tty ;;
     esac
   done
+}
+
+# Like confirm_default_yes with optional d: show_diff_cmd is run when user enters d/D (must not exit).
+confirm_default_yes_with_diff() {
+  local msg="$1"
+  shift
+  local show_diff_cmd="$1"
+  local ans
+  while true; do
+    if [[ ! -r /dev/tty ]] || [[ ! -w /dev/tty ]]; then
+      die "cannot prompt interactively (/dev/tty unavailable); use -y/--yes or run in a terminal"
+    fi
+    printf '%s\n' "$msg" >/dev/tty
+    read -r ans </dev/tty || die "cannot read confirmation from terminal; use -y/--yes"
+    case "${ans:-}" in
+      '' | [yY] | [yY][eE][sS]) return 0 ;;
+      [nN] | [nN][oO]) return 1 ;;
+      d|D) "$show_diff_cmd" ;;
+      *) printf 'Please answer y, n, or d (default yes).\n' >/dev/tty ;;
+    esac
+  done
+}
+
+normalize_src_for_pair() {
+  local wsl_f="$1" win_f="$2"
+  local ma mb
+  ma=$(mtime "$wsl_f")
+  mb=$(mtime "$win_f")
+  if [[ $ma -ge $mb ]]; then
+    printf '%s\n' "$wsl_f"
+  else
+    printf '%s\n' "$win_f"
+  fi
+}
+
+# Populate PLAN_* arrays; mirrors sync_one decisions (DRY_RUN must be off; tie → PLAN_TIE).
+plan_sync_one() {
+  local rel="$1"
+  local wsl_f="$WSL_ROOT/$rel"
+  local win_f="$WIN_ROOT/$rel"
+
+  if [[ ! -f "$wsl_f" && ! -f "$win_f" ]]; then
+    return 0
+  fi
+
+  if [[ -f "$wsl_f" && ! -f "$win_f" ]]; then
+    PLAN_COPY_TO_WIN+=("$rel")
+    return 0
+  fi
+
+  if [[ ! -f "$wsl_f" && -f "$win_f" ]]; then
+    PLAN_COPY_TO_WSL+=("$rel")
+    return 0
+  fi
+
+  if bytes_identical "$wsl_f" "$win_f"; then
+    return 0
+  fi
+  if text_same_ignoring_cr "$wsl_f" "$win_f"; then
+    if [[ $NORMALIZE_LF -eq 1 ]] && should_normalize_lf "$wsl_f"; then
+      PLAN_NORMALIZE+=("$rel")
+    fi
+    return 0
+  fi
+
+  local ma mb diff_t
+  ma=$(mtime "$wsl_f")
+  mb=$(mtime "$win_f")
+  diff_t=$(( ma > mb ? ma - mb : mb - ma ))
+
+  if [[ $diff_t -gt $TIE_SEC ]]; then
+    if [[ $ma -gt $mb ]]; then
+      PLAN_COPY_TO_WIN+=("$rel")
+    else
+      PLAN_COPY_TO_WSL+=("$rel")
+    fi
+    return 0
+  fi
+
+  PLAN_TIE+=("$rel")
+}
+
+diff_copy_to_dest() {
+  local dest="$1" src="$2" old_label="$3" new_label="$4"
+  local dest_use="$dest"
+  [[ -f "$dest" ]] || dest_use=/dev/null
+  diff -u --strip-trailing-cr -L "$old_label" -L "$new_label" "$dest_use" "$src" || true
+}
+
+show_planned_sync_diffs() {
+  local rel wsl_f win_f src tmp
+  for rel in "${PLAN_COPY_TO_WIN[@]+"${PLAN_COPY_TO_WIN[@]}"}"; do
+    wsl_f="$WSL_ROOT/$rel"
+    win_f="$WIN_ROOT/$rel"
+    echo "=== copy → Windows: $rel ==="
+    diff_copy_to_dest "$win_f" "$wsl_f" "OLD (Windows: $win_f)" "NEW (WSL → Windows: $wsl_f)"
+    echo
+  done
+  for rel in "${PLAN_COPY_TO_WSL[@]+"${PLAN_COPY_TO_WSL[@]}"}"; do
+    wsl_f="$WSL_ROOT/$rel"
+    win_f="$WIN_ROOT/$rel"
+    echo "=== copy → WSL: $rel ==="
+    diff_copy_to_dest "$wsl_f" "$win_f" "OLD (WSL: $wsl_f)" "NEW (Windows → WSL: $win_f)"
+    echo
+  done
+  for rel in "${PLAN_NORMALIZE[@]+"${PLAN_NORMALIZE[@]}"}"; do
+    wsl_f="$WSL_ROOT/$rel"
+    win_f="$WIN_ROOT/$rel"
+    src=$(normalize_src_for_pair "$wsl_f" "$win_f")
+    echo "=== LF-normalize → both: $rel (chosen src: $src) ==="
+    tmp=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-rules.pre-diff.XXXXXX")
+    sed 's/\r$//' < "$src" > "$tmp"
+    if ! cmp -s "$wsl_f" "$tmp" 2>/dev/null; then
+      diff -u --strip-trailing-cr -L "WSL (current): $wsl_f" -L "normalized (proposal)" "$wsl_f" "$tmp" || true
+      echo
+    fi
+    if ! cmp -s "$win_f" "$tmp" 2>/dev/null; then
+      diff -u --strip-trailing-cr -L "Windows (current): $win_f" -L "normalized (proposal)" "$win_f" "$tmp" || true
+      echo
+    fi
+    rm -f -- "$tmp"
+    echo
+  done
+  for rel in "${PLAN_TIE[@]+"${PLAN_TIE[@]}"}"; do
+    wsl_f="$WSL_ROOT/$rel"
+    win_f="$WIN_ROOT/$rel"
+    echo "=== mtime tie / conflict (--tie-sec $TIE_SEC): $rel ==="
+    if [[ -f "$wsl_f" && -f "$win_f" ]]; then
+      diff -u --strip-trailing-cr -L "WSL: $wsl_f" -L "Windows: $win_f" "$wsl_f" "$win_f" || true
+    else
+      echo "(cannot diff: missing file)"
+    fi
+    echo
+  done
+}
+
+print_sync_impact_summary() {
+  local nw nl nt nn
+  nw=${#PLAN_COPY_TO_WIN[@]}
+  nl=${#PLAN_COPY_TO_WSL[@]}
+  nn=${#PLAN_NORMALIZE[@]}
+  nt=${#PLAN_TIE[@]}
+  echo "Upcoming sync (this run):"
+  if ((nw)); then
+    echo "  Copy → Windows ($nw):"
+    local r
+    for r in "${PLAN_COPY_TO_WIN[@]}"; do echo "    $r"; done
+  fi
+  if ((nl)); then
+    echo "  Copy → WSL ($nl):"
+    local r2
+    for r2 in "${PLAN_COPY_TO_WSL[@]}"; do echo "    $r2"; done
+  fi
+  if ((nn)); then
+    echo "  LF-normalize → both, text types ($nn):"
+    local r3
+    for r3 in "${PLAN_NORMALIZE[@]}"; do echo "    $r3"; done
+  fi
+  if ((nt)); then
+    echo "  Mtime tie / conflict within --tie-sec=$TIE_SEC ($nt) — resolve interactively:"
+    local r4
+    for r4 in "${PLAN_TIE[@]}"; do echo "    $r4"; done
+  fi
+  echo
+}
+
+ensure_pre_sync_consent_if_needed() {
+  if [[ $DRY_RUN -eq 1 ]] || [[ $ASSUME_YES -eq 1 ]]; then
+    return 0
+  fi
+
+  PLAN_COPY_TO_WIN=()
+  PLAN_COPY_TO_WSL=()
+  PLAN_NORMALIZE=()
+  PLAN_TIE=()
+  local rel
+  for rel in "${PATHS_SORTED[@]+"${PATHS_SORTED[@]}"}"; do
+    plan_sync_one "$rel"
+  done
+
+  local total_mut total_tie
+  total_mut=$((${#PLAN_COPY_TO_WIN[@]} + ${#PLAN_COPY_TO_WSL[@]} + ${#PLAN_NORMALIZE[@]}))
+  total_tie=${#PLAN_TIE[@]}
+  if [[ $total_mut -eq 0 ]] && [[ $total_tie -eq 0 ]]; then
+    return 0
+  fi
+
+  print_sync_impact_summary
+  if ! confirm_default_yes_with_diff 'Do you want to continue? [Y/n/d]' show_planned_sync_diffs; then
+    echo 'Aborted: no file changes were made.' >&2
+    exit 0
+  fi
+  SYNC_WRITE_CONSENTED=1
 }
 
 ensure_mutating_sync_consent() {
@@ -361,9 +561,56 @@ maybe_warn_drvfs "$WSL_ROOT" "WSL"
 maybe_warn_drvfs "$WIN_ROOT" "Windows"
 echo
 
+ensure_pre_sync_consent_if_needed
+
 for rel in "${PATHS_SORTED[@]+"${PATHS_SORTED[@]}"}"; do
   sync_one "$rel"
 done
+
+git_preview_staged_diffs() {
+  local root name
+  for root in "$WSL_ROOT" "$WIN_ROOT"; do
+    if [[ "$root" == "$WSL_ROOT" ]]; then
+      name="WSL"
+    else
+      name="Windows"
+    fi
+    if [[ ! -d "$root/.git" ]]; then
+      echo "=== git preview ($name): not a git repo — skip ==="
+      echo
+      continue
+    fi
+    (
+      cd "$root" || exit 0
+      if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+        exit 0
+      fi
+      local f sub
+      for f in .gitignore .gitattributes; do
+        if [[ -f "$f" ]]; then
+          git add -- "$f"
+        fi
+      done
+      for sub in rules agents; do
+        if [[ -d "$sub" ]]; then
+          if [[ "$sub" == agents ]]; then
+            git add -f -- "$sub"
+          else
+            git add -- "$sub"
+          fi
+        fi
+      done
+      if git diff --cached --quiet; then
+        echo "=== git preview ($name): nothing staged after add (rules, agents, gitignore/attributes) ==="
+      else
+        echo "=== git preview ($name): git diff --cached (same paths as commit) ==="
+        git diff --cached || true
+      fi
+      git reset HEAD -- .gitignore .gitattributes rules agents 2>/dev/null || true
+    )
+    echo
+  done
+}
 
 git_commit_push_one() {
   local root="$1" name="$2"
@@ -422,7 +669,7 @@ git_commit_push_one() {
 
 if [[ $COMMIT_PUSH -eq 1 ]]; then
   if [[ $DRY_RUN -eq 0 ]] && [[ $ASSUME_YES -eq 0 ]]; then
-    if ! confirm_default_yes 'Proceed with git commit and push? [Y/n]'; then
+    if ! confirm_default_yes_with_diff 'Proceed with git commit and push? [Y/n/d]' git_preview_staged_diffs; then
       SKIP_GIT_COMMIT_PUSH=1
       echo 'Skipping git commit/push.' >&2
     fi
