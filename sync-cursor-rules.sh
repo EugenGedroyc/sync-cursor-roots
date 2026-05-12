@@ -41,7 +41,7 @@ NORMALIZE_LF=0
 VERBOSE=0
 WSL_ROOT="${CURSOR_WSL_ROOT:-$HOME/.cursor}"
 WIN_ROOT="${CURSOR_WIN_ROOT:-$HOME/winhome/.cursor}"
-# Lazily cleared on first mutating file write (copies / LF-normalize to both sides).
+# Set to 1 after the first successful mutating-sync confirmation (copies / LF-normalize to both).
 SYNC_WRITE_CONSENTED=0
 SKIP_GIT_COMMIT_PUSH=0
 
