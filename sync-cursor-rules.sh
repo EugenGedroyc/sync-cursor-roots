@@ -14,9 +14,14 @@
 #
 # Options:
 #   --dry-run              Print planned actions only; no copies or git writes.
-#                          When mtimes tie within --tie-sec but content differs,
-#                          prints [dry-run] conflict lines and skips (no prompt).
-#   --commit-push          After sync, git add/commit/push (rules/, agents/, .gitignore, .gitattributes)
+#                          No interactive prompts. When mtimes tie within --tie-sec
+#                          but content differs, prints [dry-run] conflict lines and skips (no prompt).
+#   -y, --yes              Skip interactive confirmations before mutating sync writes
+#                          and before git commit/push. Does not change conflict resolution:
+#                          mtime ties with differing content still use the interactive menu
+#                          unless --dry-run (which skips those conflicts).
+#   --commit-push          After sync, git add/commit/push (rules/, agents/, .gitignore, .gitattributes).
+#                          When not --dry-run, prompts before commit/push unless -y/--yes.
 #   -m, --message TEXT     Commit message (default: auto)
 #   --wsl-root PATH        Default: $CURSOR_WSL_ROOT or $HOME/.cursor
 #   --win-root PATH        Default: $CURSOR_WIN_ROOT or $HOME/winhome/.cursor
@@ -28,6 +33,7 @@
 set -euo pipefail
 
 DRY_RUN=0
+ASSUME_YES=0
 COMMIT_PUSH=0
 COMMIT_MSG=""
 TIE_SEC=0
@@ -35,8 +41,39 @@ NORMALIZE_LF=0
 VERBOSE=0
 WSL_ROOT="${CURSOR_WSL_ROOT:-$HOME/.cursor}"
 WIN_ROOT="${CURSOR_WIN_ROOT:-$HOME/winhome/.cursor}"
+# Lazily cleared on first mutating file write (copies / LF-normalize to both sides).
+SYNC_WRITE_CONSENTED=0
+SKIP_GIT_COMMIT_PUSH=0
 
 die() { echo "error: $*" >&2; exit 1; }
+
+# Prompt on /dev/tty; empty or y/yes => 0 (yes); n/no => 1 (no). Loops on invalid input.
+confirm_default_yes() {
+  local msg="$1" ans
+  while true; do
+    if [[ ! -r /dev/tty ]] || [[ ! -w /dev/tty ]]; then
+      die "cannot prompt interactively (/dev/tty unavailable); use -y/--yes or run in a terminal"
+    fi
+    printf '%s\n' "$msg" >/dev/tty
+    read -r ans </dev/tty || die "cannot read confirmation from terminal; use -y/--yes"
+    case "${ans:-}" in
+      '' | [yY] | [yY][eE][sS]) return 0 ;;
+      [nN] | [nN][oO]) return 1 ;;
+      *) printf 'Please answer y or n (default yes).\n' >/dev/tty ;;
+    esac
+  done
+}
+
+ensure_mutating_sync_consent() {
+  if [[ $DRY_RUN -eq 1 ]] || [[ $ASSUME_YES -eq 1 ]] || [[ $SYNC_WRITE_CONSENTED -eq 1 ]]; then
+    return 0
+  fi
+  if ! confirm_default_yes 'Do you want to continue? [Y/n]'; then
+    echo 'Aborted: no file changes were made.' >&2
+    exit 0
+  fi
+  SYNC_WRITE_CONSENTED=1
+}
 
 usage() {
   sed -n '2,/^[^#]/p' "$0" | sed '/^[^#]/d' | sed 's/^# \{0,1\}//'
@@ -45,6 +82,7 @@ usage() {
 while [[ $# -gt 0 ]]; do
   case "$1" in
     --dry-run) DRY_RUN=1 ;;
+    -y|--yes) ASSUME_YES=1 ;;
     --commit-push) COMMIT_PUSH=1 ;;
     -m|--message)
       [[ $# -ge 2 ]] || die "--message requires a value"
@@ -177,6 +215,7 @@ copy_file() {
     fi
     return 0
   fi
+  ensure_mutating_sync_consent
   mkdir -p "$(dirname "$dest")"
   if [[ $NORMALIZE_LF -eq 1 ]] && should_normalize_lf "$src"; then
     tmp=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-rules.XXXXXX")
@@ -254,6 +293,7 @@ sync_one() {
       if [[ $DRY_RUN -eq 1 ]]; then
         printf '[dry-run] %s: LF-normalize %s -> %s and %s\n' "$label" "$src" "$wsl_f" "$win_f"
       else
+        ensure_mutating_sync_consent
         tmp=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-rules.XXXXXX")
         sed 's/\r$//' < "$src" > "$tmp"
         cp -f -- "$tmp" "$wsl_f"
@@ -376,6 +416,15 @@ git_commit_push_one() {
 }
 
 if [[ $COMMIT_PUSH -eq 1 ]]; then
+  if [[ $DRY_RUN -eq 0 ]] && [[ $ASSUME_YES -eq 0 ]]; then
+    if ! confirm_default_yes 'Proceed with git commit and push? [Y/n]'; then
+      SKIP_GIT_COMMIT_PUSH=1
+      echo 'Skipping git commit/push.' >&2
+    fi
+  fi
+fi
+
+if [[ $COMMIT_PUSH -eq 1 ]] && [[ $SKIP_GIT_COMMIT_PUSH -eq 0 ]]; then
   echo
   echo "=== git commit/push (rules, agents, gitignore/attributes) ==="
   git_commit_push_one "$WSL_ROOT" "WSL" || true
