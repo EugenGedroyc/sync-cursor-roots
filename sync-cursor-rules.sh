@@ -12,6 +12,11 @@
 # Usage:
 #   sync-cursor-rules.sh [options]
 #
+# Assumptions:
+#   Each .cursor root should live inside a git repo if you use --commit-push.
+#   The script runs git add/commit/push from that root for rules/, agents/,
+#   .gitignore, and .gitattributes. Roots without .git are skipped for git.
+#
 # Options:
 #   --dry-run              Print planned actions only; no copies or git writes.
 #                          No interactive prompts. When mtimes tie within --tie-sec
