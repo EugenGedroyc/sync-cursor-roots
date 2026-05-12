@@ -17,6 +17,15 @@
 #   The script runs git add/commit/push from that root for rules/, agents/, skills/,
 #   .gitignore, and .gitattributes. Roots without .git are skipped for git.
 #
+# Environment (optional: $SCRIPT_DIR/.env, or a file named by SYNC_ENV_FILE):
+#   SYNC_ENV_FILE              If set and this path is readable, source it (set -a); otherwise, if
+#                              $SCRIPT_DIR/.env is readable, source that. No other paths are loaded.
+#   SYNC_IGNORE_WIN_TO_WSL     Colon-separated repo-relative paths (e.g. rules/a.mdc); skip any
+#                              copy or LF-normalize that would write Windows bytes into WSL.
+#   SYNC_IGNORE_WSL_TO_WIN     Same for paths; skip copies/normalize that would write WSL bytes
+#                              into the Windows tree. Non-empty shell exports for the two SYNC_IGNORE_*
+#                              variables win over values from the file (see README).
+#
 # Options:
 #   --dry-run                  Print planned actions only; no copies or git writes.
 #                              No interactive prompts. When mtimes tie within --tie-sec
@@ -43,6 +52,32 @@
 #   Proceed with git commit and push? [Y/n/d] — same; d runs a per-root staged diff preview.
 
 set -euo pipefail
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
+# Optional .env: export all assigned vars. Pre-set SYNC_IGNORE_* in the shell to override file values.
+load_sync_env_file() {
+  local env_path=""
+  if [[ -n "${SYNC_ENV_FILE-}" ]]; then
+    if [[ -f "$SYNC_ENV_FILE" && -r "$SYNC_ENV_FILE" ]]; then
+      env_path="$SYNC_ENV_FILE"
+    fi
+  elif [[ -f "$SCRIPT_DIR/.env" && -r "$SCRIPT_DIR/.env" ]]; then
+    env_path="$SCRIPT_DIR/.env"
+  fi
+  [[ -z "$env_path" ]] && return 0
+  local _pre_w _pre_l
+  _pre_w="${SYNC_IGNORE_WIN_TO_WSL-}"
+  _pre_l="${SYNC_IGNORE_WSL_TO_WIN-}"
+  set -a
+  # shellcheck disable=SC1090
+  source "$env_path"
+  set +a
+  [[ -n "$_pre_w" ]] && SYNC_IGNORE_WIN_TO_WSL="$_pre_w"
+  [[ -n "$_pre_l" ]] && SYNC_IGNORE_WSL_TO_WIN="$_pre_l"
+}
+
+load_sync_env_file
 
 DRY_RUN=0
 ASSUME_YES=0
@@ -110,6 +145,57 @@ confirm_default_yes_with_diff() {
   done
 }
 
+# Populated by build_sync_ignore_maps() from SYNC_IGNORE_* (colon-separated rel paths).
+declare -A SYNC_IGNORE_WIN_TO_WSL_MAP=()
+declare -A SYNC_IGNORE_WSL_TO_WIN_MAP=()
+
+trim() {
+  local s="$1"
+  s="${s#"${s%%[![:space:]]*}"}"
+  s="${s%"${s##*[![:space:]]}"}"
+  printf '%s\n' "$s"
+}
+
+fill_ignore_map_from_var() {
+  local value="$1"
+  local -n target_map="$2"
+  target_map=()
+  [[ -z "$value" ]] && return 0
+  local IFS=':'
+  local seg
+  for seg in $value; do
+    seg=$(trim "$seg")
+    # nameref; shellcheck does not see writes via target_map
+    # shellcheck disable=SC2034
+    [[ -n "$seg" ]] && target_map["$seg"]=1
+  done
+}
+
+build_sync_ignore_maps() {
+  fill_ignore_map_from_var "${SYNC_IGNORE_WIN_TO_WSL-}" SYNC_IGNORE_WIN_TO_WSL_MAP
+  fill_ignore_map_from_var "${SYNC_IGNORE_WSL_TO_WIN-}" SYNC_IGNORE_WSL_TO_WIN_MAP
+}
+
+rel_blocked_win_to_wsl() {
+  [[ -n "${SYNC_IGNORE_WIN_TO_WSL_MAP[$1]+x}" ]]
+}
+
+rel_blocked_wsl_to_win() {
+  [[ -n "${SYNC_IGNORE_WSL_TO_WIN_MAP[$1]+x}" ]]
+}
+
+# stdout: [dry-run] lines (match other dry-run copy messages).
+dry_run_skip_ignore() {
+  local which="$1" rel="$2"
+  printf '[dry-run] skipped (%s): %s\n' "$which" "$rel"
+}
+
+# Non-dry: align with --verbose skips (e.g. EOL-only).
+skip_ignore_msg() {
+  local tag="$1" rel="$2"
+  [[ $VERBOSE -eq 1 ]] && printf 'skip (ignored %s): %s\n' "$tag" "$rel" >&2
+}
+
 normalize_src_for_pair() {
   local wsl_f="$1" win_f="$2"
   local ma mb
@@ -133,11 +219,17 @@ plan_sync_one() {
   fi
 
   if [[ -f "$wsl_f" && ! -f "$win_f" ]]; then
+    if rel_blocked_wsl_to_win "$rel"; then
+      return 0
+    fi
     PLAN_COPY_TO_WIN+=("$rel")
     return 0
   fi
 
   if [[ ! -f "$wsl_f" && -f "$win_f" ]]; then
+    if rel_blocked_win_to_wsl "$rel"; then
+      return 0
+    fi
     PLAN_COPY_TO_WSL+=("$rel")
     return 0
   fi
@@ -147,6 +239,20 @@ plan_sync_one() {
   fi
   if text_same_ignoring_cr "$wsl_f" "$win_f"; then
     if [[ $NORMALIZE_LF -eq 1 ]] && should_normalize_lf "$wsl_f"; then
+      local ma0 mb0 src0
+      ma0=$(mtime "$wsl_f")
+      mb0=$(mtime "$win_f")
+      if [[ $ma0 -ge $mb0 ]]; then
+        src0=$wsl_f
+      else
+        src0=$win_f
+      fi
+      if [[ "$src0" == "$win_f" ]] && rel_blocked_win_to_wsl "$rel"; then
+        return 0
+      fi
+      if [[ "$src0" == "$wsl_f" ]] && rel_blocked_wsl_to_win "$rel"; then
+        return 0
+      fi
       PLAN_NORMALIZE+=("$rel")
     fi
     return 0
@@ -159,8 +265,14 @@ plan_sync_one() {
 
   if [[ $diff_t -gt $TIE_SEC ]]; then
     if [[ $ma -gt $mb ]]; then
+      if rel_blocked_wsl_to_win "$rel"; then
+        return 0
+      fi
       PLAN_COPY_TO_WIN+=("$rel")
     else
+      if rel_blocked_win_to_wsl "$rel"; then
+        return 0
+      fi
       PLAN_COPY_TO_WSL+=("$rel")
     fi
     return 0
@@ -421,6 +533,8 @@ if ((${#PATHS[@]})); then
   mapfile -t PATHS_SORTED < <(printf '%s\n' "${PATHS[@]}" | sort -u)
 fi
 
+build_sync_ignore_maps
+
 copy_file() {
   local src="$1" dest="$2"
   local label="$3"
@@ -488,11 +602,27 @@ sync_one() {
   fi
 
   if [[ -f "$wsl_f" && ! -f "$win_f" ]]; then
+    if rel_blocked_wsl_to_win "$rel"; then
+      if [[ $DRY_RUN -eq 1 ]]; then
+        dry_run_skip_ignore "SYNC_IGNORE_WSL_TO_WIN" "$rel"
+      else
+        skip_ignore_msg "WSL→Windows" "$rel"
+      fi
+      return 0
+    fi
     copy_file "$wsl_f" "$win_f" "WSL -> Windows ($rel)"
     return 0
   fi
 
   if [[ ! -f "$wsl_f" && -f "$win_f" ]]; then
+    if rel_blocked_win_to_wsl "$rel"; then
+      if [[ $DRY_RUN -eq 1 ]]; then
+        dry_run_skip_ignore "SYNC_IGNORE_WIN_TO_WSL" "$rel"
+      else
+        skip_ignore_msg "WIN→WSL" "$rel"
+      fi
+      return 0
+    fi
     copy_file "$win_f" "$wsl_f" "Windows -> WSL ($rel)"
     return 0
   fi
@@ -511,6 +641,22 @@ sync_one() {
       else
         src=$win_f
         label="EOL normalize (from Windows mtime) -> both ($rel)"
+      fi
+      if [[ "$src" == "$win_f" ]] && rel_blocked_win_to_wsl "$rel"; then
+        if [[ $DRY_RUN -eq 1 ]]; then
+          dry_run_skip_ignore "SYNC_IGNORE_WIN_TO_WSL" "$rel"
+        else
+          skip_ignore_msg "WIN→WSL (LF-normalize)" "$rel"
+        fi
+        return 0
+      fi
+      if [[ "$src" == "$wsl_f" ]] && rel_blocked_wsl_to_win "$rel"; then
+        if [[ $DRY_RUN -eq 1 ]]; then
+          dry_run_skip_ignore "SYNC_IGNORE_WSL_TO_WIN" "$rel"
+        else
+          skip_ignore_msg "WSL→Windows (LF-normalize)" "$rel"
+        fi
+        return 0
       fi
       if [[ $DRY_RUN -eq 1 ]]; then
         printf '[dry-run] %s: LF-normalize %s -> %s and %s\n' "$label" "$src" "$wsl_f" "$win_f"
@@ -538,8 +684,24 @@ sync_one() {
 
   if [[ $diff_t -gt $TIE_SEC ]]; then
     if [[ $ma -gt $mb ]]; then
+      if rel_blocked_wsl_to_win "$rel"; then
+        if [[ $DRY_RUN -eq 1 ]]; then
+          dry_run_skip_ignore "SYNC_IGNORE_WSL_TO_WIN" "$rel"
+        else
+          skip_ignore_msg "WSL→Windows" "$rel"
+        fi
+        return 0
+      fi
       copy_file "$wsl_f" "$win_f" "WSL newer -> Windows ($rel)"
     else
+      if rel_blocked_win_to_wsl "$rel"; then
+        if [[ $DRY_RUN -eq 1 ]]; then
+          dry_run_skip_ignore "SYNC_IGNORE_WIN_TO_WSL" "$rel"
+        else
+          skip_ignore_msg "WIN→WSL" "$rel"
+        fi
+        return 0
+      fi
       copy_file "$win_f" "$wsl_f" "Windows newer -> WSL ($rel)"
     fi
     return 0
@@ -561,8 +723,16 @@ sync_one() {
   [[ -n "$winner" ]] || return 0
 
   if [[ "$winner" == "$wsl_f" ]]; then
+    if rel_blocked_wsl_to_win "$rel"; then
+      printf 'refused: resolved to WSL but SYNC_IGNORE_WSL_TO_WIN blocks copy to Windows: %s\n' "$rel" >&2
+      return 0
+    fi
     copy_file "$wsl_f" "$win_f" "resolved WSL -> Windows ($rel)"
   else
+    if rel_blocked_win_to_wsl "$rel"; then
+      printf 'refused: resolved to Windows but SYNC_IGNORE_WIN_TO_WSL blocks copy to WSL: %s\n' "$rel" >&2
+      return 0
+    fi
     copy_file "$win_f" "$wsl_f" "resolved Windows -> WSL ($rel)"
   fi
 }
