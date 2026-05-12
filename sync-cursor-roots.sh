@@ -6,8 +6,9 @@
 # - One root may live on a native Linux filesystem (e.g. ext4) and the other on a 9p/drvfs mount.
 #   mtimes can land in the same 1s bucket across those; use --tie-sec 1 or 2 if you see bad picks.
 # - Working-tree bytes can still be CRLF on one side; comparisons treat CRLF vs LF as equal
-#   (diff --strip-trailing-cr). Use --normalize-lf on copies so destinations are LF for text
-#   extensions (.md/.mdc/.json/.yaml/.txt). Keep .gitattributes with eol=lf for those paths.
+#   (diff --strip-trailing-cr). Text extensions auto LF-normalize on both roots when only EOL
+#   differs (no --normalize-lf needed). Use --normalize-lf to strip CR on content-changing copies.
+#   Keep .gitattributes with eol=lf for those paths.
 #
 # Usage:
 #   sync-cursor-roots.sh [options]
@@ -245,7 +246,9 @@ plan_sync_one() {
     return 0
   fi
   if text_same_ignoring_cr "$root1_f" "$root2_f"; then
-    if [[ $NORMALIZE_LF -eq 1 ]] && should_normalize_lf "$root1_f"; then
+    # CRLF vs LF only: cmp differs but diff --strip-trailing-cr agrees; normalize listed text types
+    # on both sides without requiring --normalize-lf so cross-mount skills/rules stay convergent.
+    if should_normalize_lf "$root1_f"; then
       local ma0 mb0 src0
       ma0=$(mtime "$root1_f")
       mb0=$(mtime "$root2_f")
@@ -653,7 +656,9 @@ sync_one() {
     return 0
   fi
   if text_same_ignoring_cr "$root1_f" "$root2_f"; then
-    if [[ $NORMALIZE_LF -eq 1 ]] && should_normalize_lf "$root1_f"; then
+    # CRLF vs LF only: cmp differs but diff --strip-trailing-cr agrees; normalize listed text types
+    # on both sides without requiring --normalize-lf so cross-mount skills/rules stay convergent.
+    if should_normalize_lf "$root1_f"; then
       local ma mb src tmp label
       ma=$(mtime "$root1_f")
       mb=$(mtime "$root2_f")

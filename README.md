@@ -34,3 +34,7 @@ Commented samples: `.env.example` in this repo.
 Without `-y` / `--yes`, the script asks before the first real copy and again before any git commit/push. `--dry-run` prints what would happen and touches nothing.
 
 Full flags: `./sync-cursor-roots.sh --help`.
+
+## Line endings
+
+If the **only** difference is CRLF vs LF (common across Linux vs Windows/9p mounts), paths like `.md`/`.mdc`/`.json`/`.yaml`/`.txt` are LF-normalized on **both** roots automatically—you do not need `--normalize-lf` for that case. Pass `--normalize-lf` when you also want CR stripped on ordinary copies where content differs.
