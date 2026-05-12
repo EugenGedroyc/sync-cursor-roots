@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# Sync Cursor rules/, agents/, and skills/ between two .cursor roots (e.g. WSL vs Windows mount).
+# Sync Cursor rules/, agents/, and skills/ between two .cursor roots (see CURSOR_ROOT_1 / CURSOR_ROOT_2).
 # Uses newer mtime when content differs; prompts when mtimes tie (or with --tie-sec).
 #
 # Cross-filesystem / line endings (QA):
-# - A Windows .cursor dir is often NTFS reached from WSL via drvfs (df type "9p"). mtimes
-#   can land in the same 1s bucket as ext4 files; use --tie-sec 1 or 2 if you see bad picks.
+# - One root may live on a native Linux filesystem (e.g. ext4) and the other on a 9p/drvfs mount.
+#   mtimes can land in the same 1s bucket across those; use --tie-sec 1 or 2 if you see bad picks.
 # - Working-tree bytes can still be CRLF on one side; comparisons treat CRLF vs LF as equal
 #   (diff --strip-trailing-cr). Use --normalize-lf on copies so destinations are LF for text
 #   extensions (.md/.mdc/.json/.yaml/.txt). Keep .gitattributes with eol=lf for those paths.
@@ -20,11 +20,13 @@
 # Environment (optional: $SCRIPT_DIR/.env, or a file named by SYNC_ENV_FILE):
 #   SYNC_ENV_FILE              If set and this path is readable, source it (set -a); otherwise, if
 #                              $SCRIPT_DIR/.env is readable, source that. No other paths are loaded.
-#   SYNC_IGNORE_WIN_TO_WSL     Colon-separated repo-relative paths (e.g. rules/a.mdc); skip any
-#                              copy or LF-normalize that would write Windows bytes into WSL.
-#   SYNC_IGNORE_WSL_TO_WIN     Same for paths; skip copies/normalize that would write WSL bytes
-#                              into the Windows tree. Non-empty shell exports for the two SYNC_IGNORE_*
-#                              variables win over values from the file (see README).
+#   CURSOR_ROOT_1              First .cursor root directory (default: $HOME/.cursor if unset).
+#   CURSOR_ROOT_2              Second .cursor root directory (required: set in .env or pass --root-2).
+#   SYNC_IGNORE_2_TO_1         Colon-separated repo-relative paths (e.g. rules/a.mdc); skip any
+#                              copy or LF-normalize that would write root 2 bytes into root 1.
+#   SYNC_IGNORE_1_TO_2         Same for paths; skip copies/normalize that would write root 1 bytes
+#                              into root 2. Non-empty shell exports for the two SYNC_IGNORE_* variables
+#                              win over values from the file (see README).
 #
 # Options:
 #   --dry-run                  Print planned actions only; no copies or git writes.
@@ -39,8 +41,8 @@
 #                              gitignore, gitattributes). When not --dry-run, prompts before commit/push
 #                              unless -y/--yes.
 #   -m, --message TEXT         Commit message (default: auto)
-#   --wsl-root PATH            Default: $CURSOR_WSL_ROOT or $HOME/.cursor
-#   --win-root PATH            Default: $CURSOR_WIN_ROOT or $HOME/winhome/.cursor
+#   --root-1 PATH              Cursor root 1 (default: $CURSOR_ROOT_1 or $HOME/.cursor)
+#   --root-2 PATH              Cursor root 2 (default: $CURSOR_ROOT_2; required if unset)
 #   --tie-sec N                If |mtime_a-mtime_b| <= N and content differs, prompt (default: 0)
 #   --normalize-lf             When copying, strip CR for common text extensions (see script)
 #   --verbose                  Log skips for CRLF-only differences
@@ -66,15 +68,15 @@ load_sync_env_file() {
     env_path="$SCRIPT_DIR/.env"
   fi
   [[ -z "$env_path" ]] && return 0
-  local _pre_w _pre_l
-  _pre_w="${SYNC_IGNORE_WIN_TO_WSL-}"
-  _pre_l="${SYNC_IGNORE_WSL_TO_WIN-}"
+  local _pre_1_to_2 _pre_2_to_1
+  _pre_1_to_2="${SYNC_IGNORE_1_TO_2-}"
+  _pre_2_to_1="${SYNC_IGNORE_2_TO_1-}"
   set -a
   # shellcheck disable=SC1090
   source "$env_path"
   set +a
-  [[ -n "$_pre_w" ]] && SYNC_IGNORE_WIN_TO_WSL="$_pre_w"
-  [[ -n "$_pre_l" ]] && SYNC_IGNORE_WSL_TO_WIN="$_pre_l"
+  [[ -n "$_pre_1_to_2" ]] && SYNC_IGNORE_1_TO_2="$_pre_1_to_2"
+  [[ -n "$_pre_2_to_1" ]] && SYNC_IGNORE_2_TO_1="$_pre_2_to_1"
 }
 
 load_sync_env_file
@@ -86,8 +88,8 @@ COMMIT_MSG=""
 TIE_SEC=0
 NORMALIZE_LF=0
 VERBOSE=0
-WSL_ROOT="${CURSOR_WSL_ROOT:-$HOME/.cursor}"
-WIN_ROOT="${CURSOR_WIN_ROOT:-$HOME/winhome/.cursor}"
+ROOT1="${CURSOR_ROOT_1:-$HOME/.cursor}"
+ROOT2="${CURSOR_ROOT_2:-}"
 # Set to 1 after the first successful mutating-sync confirmation (copies / LF-normalize to both).
 SYNC_WRITE_CONSENTED=0
 SKIP_GIT_COMMIT_PUSH=0
@@ -146,8 +148,8 @@ confirm_default_yes_with_diff() {
 }
 
 # Populated by build_sync_ignore_maps() from SYNC_IGNORE_* (colon-separated rel paths).
-declare -A SYNC_IGNORE_WIN_TO_WSL_MAP=()
-declare -A SYNC_IGNORE_WSL_TO_WIN_MAP=()
+declare -A SYNC_IGNORE_2_TO_1_MAP=()
+declare -A SYNC_IGNORE_1_TO_2_MAP=()
 
 trim() {
   local s="$1"
@@ -172,16 +174,16 @@ fill_ignore_map_from_var() {
 }
 
 build_sync_ignore_maps() {
-  fill_ignore_map_from_var "${SYNC_IGNORE_WIN_TO_WSL-}" SYNC_IGNORE_WIN_TO_WSL_MAP
-  fill_ignore_map_from_var "${SYNC_IGNORE_WSL_TO_WIN-}" SYNC_IGNORE_WSL_TO_WIN_MAP
+  fill_ignore_map_from_var "${SYNC_IGNORE_2_TO_1-}" SYNC_IGNORE_2_TO_1_MAP
+  fill_ignore_map_from_var "${SYNC_IGNORE_1_TO_2-}" SYNC_IGNORE_1_TO_2_MAP
 }
 
-rel_blocked_win_to_wsl() {
-  [[ -n "${SYNC_IGNORE_WIN_TO_WSL_MAP[$1]+x}" ]]
+rel_blocked_2_to_1() {
+  [[ -n "${SYNC_IGNORE_2_TO_1_MAP[$1]+x}" ]]
 }
 
-rel_blocked_wsl_to_win() {
-  [[ -n "${SYNC_IGNORE_WSL_TO_WIN_MAP[$1]+x}" ]]
+rel_blocked_1_to_2() {
+  [[ -n "${SYNC_IGNORE_1_TO_2_MAP[$1]+x}" ]]
 }
 
 # stdout: [dry-run] lines (match other dry-run copy messages).
@@ -197,60 +199,60 @@ skip_ignore_msg() {
 }
 
 normalize_src_for_pair() {
-  local wsl_f="$1" win_f="$2"
+  local root1_f="$1" root2_f="$2"
   local ma mb
-  ma=$(mtime "$wsl_f")
-  mb=$(mtime "$win_f")
+  ma=$(mtime "$root1_f")
+  mb=$(mtime "$root2_f")
   if [[ $ma -ge $mb ]]; then
-    printf '%s\n' "$wsl_f"
+    printf '%s\n' "$root1_f"
   else
-    printf '%s\n' "$win_f"
+    printf '%s\n' "$root2_f"
   fi
 }
 
 # Populate PLAN_* arrays; mirrors sync_one decisions (DRY_RUN must be off; tie → PLAN_TIE).
 plan_sync_one() {
   local rel="$1"
-  local wsl_f="$WSL_ROOT/$rel"
-  local win_f="$WIN_ROOT/$rel"
+  local root1_f="$ROOT1/$rel"
+  local root2_f="$ROOT2/$rel"
 
-  if [[ ! -f "$wsl_f" && ! -f "$win_f" ]]; then
+  if [[ ! -f "$root1_f" && ! -f "$root2_f" ]]; then
     return 0
   fi
 
-  if [[ -f "$wsl_f" && ! -f "$win_f" ]]; then
-    if rel_blocked_wsl_to_win "$rel"; then
+  if [[ -f "$root1_f" && ! -f "$root2_f" ]]; then
+    if rel_blocked_1_to_2 "$rel"; then
       return 0
     fi
-    PLAN_COPY_TO_WIN+=("$rel")
+    PLAN_COPY_TO_2+=("$rel")
     return 0
   fi
 
-  if [[ ! -f "$wsl_f" && -f "$win_f" ]]; then
-    if rel_blocked_win_to_wsl "$rel"; then
+  if [[ ! -f "$root1_f" && -f "$root2_f" ]]; then
+    if rel_blocked_2_to_1 "$rel"; then
       return 0
     fi
-    PLAN_COPY_TO_WSL+=("$rel")
+    PLAN_COPY_TO_1+=("$rel")
     return 0
   fi
 
-  if bytes_identical "$wsl_f" "$win_f"; then
+  if bytes_identical "$root1_f" "$root2_f"; then
     return 0
   fi
-  if text_same_ignoring_cr "$wsl_f" "$win_f"; then
-    if [[ $NORMALIZE_LF -eq 1 ]] && should_normalize_lf "$wsl_f"; then
+  if text_same_ignoring_cr "$root1_f" "$root2_f"; then
+    if [[ $NORMALIZE_LF -eq 1 ]] && should_normalize_lf "$root1_f"; then
       local ma0 mb0 src0
-      ma0=$(mtime "$wsl_f")
-      mb0=$(mtime "$win_f")
+      ma0=$(mtime "$root1_f")
+      mb0=$(mtime "$root2_f")
       if [[ $ma0 -ge $mb0 ]]; then
-        src0=$wsl_f
+        src0=$root1_f
       else
-        src0=$win_f
+        src0=$root2_f
       fi
-      if [[ "$src0" == "$win_f" ]] && rel_blocked_win_to_wsl "$rel"; then
+      if [[ "$src0" == "$root2_f" ]] && rel_blocked_2_to_1 "$rel"; then
         return 0
       fi
-      if [[ "$src0" == "$wsl_f" ]] && rel_blocked_wsl_to_win "$rel"; then
+      if [[ "$src0" == "$root1_f" ]] && rel_blocked_1_to_2 "$rel"; then
         return 0
       fi
       PLAN_NORMALIZE+=("$rel")
@@ -259,21 +261,21 @@ plan_sync_one() {
   fi
 
   local ma mb diff_t
-  ma=$(mtime "$wsl_f")
-  mb=$(mtime "$win_f")
+  ma=$(mtime "$root1_f")
+  mb=$(mtime "$root2_f")
   diff_t=$(( ma > mb ? ma - mb : mb - ma ))
 
   if [[ $diff_t -gt $TIE_SEC ]]; then
     if [[ $ma -gt $mb ]]; then
-      if rel_blocked_wsl_to_win "$rel"; then
+      if rel_blocked_1_to_2 "$rel"; then
         return 0
       fi
-      PLAN_COPY_TO_WIN+=("$rel")
+      PLAN_COPY_TO_2+=("$rel")
     else
-      if rel_blocked_win_to_wsl "$rel"; then
+      if rel_blocked_2_to_1 "$rel"; then
         return 0
       fi
-      PLAN_COPY_TO_WSL+=("$rel")
+      PLAN_COPY_TO_1+=("$rel")
     fi
     return 0
   fi
@@ -289,45 +291,45 @@ diff_copy_to_dest() {
 }
 
 show_planned_sync_diffs() {
-  local rel wsl_f win_f src tmp
-  for rel in "${PLAN_COPY_TO_WIN[@]+"${PLAN_COPY_TO_WIN[@]}"}"; do
-    wsl_f="$WSL_ROOT/$rel"
-    win_f="$WIN_ROOT/$rel"
-    echo "=== copy → Windows: $rel ==="
-    diff_copy_to_dest "$win_f" "$wsl_f" "OLD (Windows: $win_f)" "NEW (WSL → Windows: $wsl_f)"
+  local rel root1_f root2_f src tmp
+  for rel in "${PLAN_COPY_TO_2[@]+"${PLAN_COPY_TO_2[@]}"}"; do
+    root1_f="$ROOT1/$rel"
+    root2_f="$ROOT2/$rel"
+    echo "=== copy → root 2: $rel ==="
+    diff_copy_to_dest "$root2_f" "$root1_f" "OLD (root 2: $root2_f)" "NEW (root 1 → root 2: $root1_f)"
     echo
   done
-  for rel in "${PLAN_COPY_TO_WSL[@]+"${PLAN_COPY_TO_WSL[@]}"}"; do
-    wsl_f="$WSL_ROOT/$rel"
-    win_f="$WIN_ROOT/$rel"
-    echo "=== copy → WSL: $rel ==="
-    diff_copy_to_dest "$wsl_f" "$win_f" "OLD (WSL: $wsl_f)" "NEW (Windows → WSL: $win_f)"
+  for rel in "${PLAN_COPY_TO_1[@]+"${PLAN_COPY_TO_1[@]}"}"; do
+    root1_f="$ROOT1/$rel"
+    root2_f="$ROOT2/$rel"
+    echo "=== copy → root 1: $rel ==="
+    diff_copy_to_dest "$root1_f" "$root2_f" "OLD (root 1: $root1_f)" "NEW (root 2 → root 1: $root2_f)"
     echo
   done
   for rel in "${PLAN_NORMALIZE[@]+"${PLAN_NORMALIZE[@]}"}"; do
-    wsl_f="$WSL_ROOT/$rel"
-    win_f="$WIN_ROOT/$rel"
-    src=$(normalize_src_for_pair "$wsl_f" "$win_f")
+    root1_f="$ROOT1/$rel"
+    root2_f="$ROOT2/$rel"
+    src=$(normalize_src_for_pair "$root1_f" "$root2_f")
     echo "=== LF-normalize → both: $rel (chosen src: $src) ==="
     tmp=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-rules.pre-diff.XXXXXX")
     sed 's/\r$//' < "$src" > "$tmp"
-    if ! cmp -s "$wsl_f" "$tmp" 2>/dev/null; then
-      diff_unified -L "WSL (current): $wsl_f" -L "normalized (proposal)" "$wsl_f" "$tmp"
+    if ! cmp -s "$root1_f" "$tmp" 2>/dev/null; then
+      diff_unified -L "root 1 (current): $root1_f" -L "normalized (proposal)" "$root1_f" "$tmp"
       echo
     fi
-    if ! cmp -s "$win_f" "$tmp" 2>/dev/null; then
-      diff_unified -L "Windows (current): $win_f" -L "normalized (proposal)" "$win_f" "$tmp"
+    if ! cmp -s "$root2_f" "$tmp" 2>/dev/null; then
+      diff_unified -L "root 2 (current): $root2_f" -L "normalized (proposal)" "$root2_f" "$tmp"
       echo
     fi
     rm -f -- "$tmp"
     echo
   done
   for rel in "${PLAN_TIE[@]+"${PLAN_TIE[@]}"}"; do
-    wsl_f="$WSL_ROOT/$rel"
-    win_f="$WIN_ROOT/$rel"
+    root1_f="$ROOT1/$rel"
+    root2_f="$ROOT2/$rel"
     echo "=== mtime tie / conflict (--tie-sec $TIE_SEC): $rel ==="
-    if [[ -f "$wsl_f" && -f "$win_f" ]]; then
-      diff_unified -L "WSL: $wsl_f" -L "Windows: $win_f" "$wsl_f" "$win_f"
+    if [[ -f "$root1_f" && -f "$root2_f" ]]; then
+      diff_unified -L "root 1: $root1_f" -L "root 2: $root2_f" "$root1_f" "$root2_f"
     else
       echo "(cannot diff: missing file)"
     fi
@@ -336,21 +338,21 @@ show_planned_sync_diffs() {
 }
 
 print_sync_impact_summary() {
-  local nw nl nt nn
-  nw=${#PLAN_COPY_TO_WIN[@]}
-  nl=${#PLAN_COPY_TO_WSL[@]}
+  local n2 n1 nt nn
+  n2=${#PLAN_COPY_TO_2[@]}
+  n1=${#PLAN_COPY_TO_1[@]}
   nn=${#PLAN_NORMALIZE[@]}
   nt=${#PLAN_TIE[@]}
   echo "Upcoming sync (this run):"
-  if ((nw)); then
-    echo "  Copy → Windows ($nw):"
+  if ((n2)); then
+    echo "  Copy → root 2 ($n2):"
     local r
-    for r in "${PLAN_COPY_TO_WIN[@]}"; do echo "    $r"; done
+    for r in "${PLAN_COPY_TO_2[@]}"; do echo "    $r"; done
   fi
-  if ((nl)); then
-    echo "  Copy → WSL ($nl):"
+  if ((n1)); then
+    echo "  Copy → root 1 ($n1):"
     local r2
-    for r2 in "${PLAN_COPY_TO_WSL[@]}"; do echo "    $r2"; done
+    for r2 in "${PLAN_COPY_TO_1[@]}"; do echo "    $r2"; done
   fi
   if ((nn)); then
     echo "  LF-normalize → both, text types ($nn):"
@@ -370,8 +372,8 @@ ensure_pre_sync_consent_if_needed() {
     return 0
   fi
 
-  PLAN_COPY_TO_WIN=()
-  PLAN_COPY_TO_WSL=()
+  PLAN_COPY_TO_2=()
+  PLAN_COPY_TO_1=()
   PLAN_NORMALIZE=()
   PLAN_TIE=()
   local rel
@@ -380,7 +382,7 @@ ensure_pre_sync_consent_if_needed() {
   done
 
   local total_mut total_tie
-  total_mut=$((${#PLAN_COPY_TO_WIN[@]} + ${#PLAN_COPY_TO_WSL[@]} + ${#PLAN_NORMALIZE[@]}))
+  total_mut=$((${#PLAN_COPY_TO_2[@]} + ${#PLAN_COPY_TO_1[@]} + ${#PLAN_NORMALIZE[@]}))
   total_tie=${#PLAN_TIE[@]}
   if [[ $total_mut -eq 0 ]] && [[ $total_tie -eq 0 ]]; then
     return 0
@@ -419,14 +421,14 @@ while [[ $# -gt 0 ]]; do
       COMMIT_MSG="$2"
       shift
       ;;
-    --wsl-root)
-      [[ $# -ge 2 ]] || die "--wsl-root requires a path"
-      WSL_ROOT="$2"
+    --root-1)
+      [[ $# -ge 2 ]] || die "--root-1 requires a path"
+      ROOT1="$2"
       shift
       ;;
-    --win-root)
-      [[ $# -ge 2 ]] || die "--win-root requires a path"
-      WIN_ROOT="$2"
+    --root-2)
+      [[ $# -ge 2 ]] || die "--root-2 requires a path"
+      ROOT2="$2"
       shift
       ;;
     --tie-sec)
@@ -443,18 +445,19 @@ while [[ $# -gt 0 ]]; do
   shift
 done
 
-[[ -d "$WSL_ROOT" ]] || die "WSL root not a directory: $WSL_ROOT"
-[[ -d "$WIN_ROOT" ]] || die "Windows root not a directory: $WIN_ROOT"
+[[ -n "${ROOT2}" ]] || die "CURSOR_ROOT_2 must be set in .env (or SYNC_ENV_FILE) or pass --root-2 PATH"
+[[ -d "$ROOT1" ]] || die "cursor root 1 not a directory: $ROOT1"
+[[ -d "$ROOT2" ]] || die "cursor root 2 not a directory: $ROOT2"
 
 resolve_root() {
   local p="$1"
   readlink -f "$p" 2>/dev/null || echo "$p"
 }
 
-WSL_CFG=$WSL_ROOT
-WIN_CFG=$WIN_ROOT
-WSL_ROOT=$(resolve_root "$WSL_ROOT")
-WIN_ROOT=$(resolve_root "$WIN_ROOT")
+ROOT1_CFG=$ROOT1
+ROOT2_CFG=$ROOT2
+ROOT1=$(resolve_root "$ROOT1")
+ROOT2=$(resolve_root "$ROOT2")
 
 fs_type() {
   df -T "$1" 2>/dev/null | awk 'NR==2 {print $2}'
@@ -465,8 +468,8 @@ maybe_warn_drvfs() {
   local t
   t=$(fs_type "$root")
   if [[ "$t" == "9p" ]]; then
-    echo "note: $label .cursor is on WSL drvfs/9p ($root)." >&2
-    echo "      Same-second mtimes happen across ext4<->drvfs; try --tie-sec 1 or 2 if picks look wrong." >&2
+    echo "note: cursor root ($label) looks like a 9p/drvfs-style mount ($root)." >&2
+    echo "      Same-second mtimes happen across native fs vs 9p/drvfs; try --tie-sec 1 or 2 if picks look wrong." >&2
   fi
 }
 
@@ -509,24 +512,24 @@ declare -A SEEN_PATHS
 PATHS=()
 
 while IFS= read -r -d '' f; do
-  rel="${f#"$WSL_ROOT"/}"
+  rel="${f#"$ROOT1"/}"
   if [[ -n "$rel" && "$rel" != "$f" ]]; then
     if [[ -z "${SEEN_PATHS[$rel]+x}" ]]; then
       SEEN_PATHS[$rel]=1
       PATHS+=("$rel")
     fi
   fi
-done < <(collect_relpaths "$WSL_ROOT")
+done < <(collect_relpaths "$ROOT1")
 
 while IFS= read -r -d '' f; do
-  rel="${f#"$WIN_ROOT"/}"
+  rel="${f#"$ROOT2"/}"
   if [[ -n "$rel" && "$rel" != "$f" ]]; then
     if [[ -z "${SEEN_PATHS[$rel]+x}" ]]; then
       SEEN_PATHS[$rel]=1
       PATHS+=("$rel")
     fi
   fi
-done < <(collect_relpaths "$WIN_ROOT")
+done < <(collect_relpaths "$ROOT2")
 
 PATHS_SORTED=()
 if ((${#PATHS[@]})); then
@@ -562,26 +565,26 @@ copy_file() {
 }
 
 resolve_conflict() {
-  local rel="$1" wsl_f="$2" win_f="$3"
+  local rel="$1" root1_f="$2" root2_f="$3"
   local choice
   while true; do
     echo >&2
     echo >&2 "Conflict: $rel"
-    echo >&2 "  [1] keep WSL  ($wsl_f)"
-    echo >&2 "  [2] keep Windows ($win_f)"
+    echo >&2 "  [1] keep root 1  ($root1_f)"
+    echo >&2 "  [2] keep root 2 ($root2_f)"
     echo >&2 "  [3] skip (leave both as-is)"
     echo >&2 "  [d] show unified diff"
     read -r -p "Choose (1/2/3/d): " choice </dev/tty || true
     case "${choice:-}" in
-      1) printf '%s\n' "$wsl_f"; return 0 ;;
-      2) printf '%s\n' "$win_f"; return 0 ;;
+      1) printf '%s\n' "$root1_f"; return 0 ;;
+      2) printf '%s\n' "$root2_f"; return 0 ;;
       3) return 1 ;;
       d|D)
-        if [[ -f "$wsl_f" && -f "$win_f" ]]; then
+        if [[ -f "$root1_f" && -f "$root2_f" ]]; then
           if ((${#DIFF_COLOR_FLAG[@]})); then
-            diff --color=always -u --strip-trailing-cr "$wsl_f" "$win_f" | sed -n '1,200p' >&2 || true
+            diff --color=always -u --strip-trailing-cr "$root1_f" "$root2_f" | sed -n '1,200p' >&2 || true
           else
-            diff -u --strip-trailing-cr "$wsl_f" "$win_f" | sed -n '1,200p' >&2 || true
+            diff -u --strip-trailing-cr "$root1_f" "$root2_f" | sed -n '1,200p' >&2 || true
           fi
         else
           echo >&2 "(cannot diff: missing file)"
@@ -594,81 +597,81 @@ resolve_conflict() {
 
 sync_one() {
   local rel="$1"
-  local wsl_f="$WSL_ROOT/$rel"
-  local win_f="$WIN_ROOT/$rel"
+  local root1_f="$ROOT1/$rel"
+  local root2_f="$ROOT2/$rel"
 
-  if [[ ! -f "$wsl_f" && ! -f "$win_f" ]]; then
+  if [[ ! -f "$root1_f" && ! -f "$root2_f" ]]; then
     return 0
   fi
 
-  if [[ -f "$wsl_f" && ! -f "$win_f" ]]; then
-    if rel_blocked_wsl_to_win "$rel"; then
+  if [[ -f "$root1_f" && ! -f "$root2_f" ]]; then
+    if rel_blocked_1_to_2 "$rel"; then
       if [[ $DRY_RUN -eq 1 ]]; then
-        dry_run_skip_ignore "SYNC_IGNORE_WSL_TO_WIN" "$rel"
+        dry_run_skip_ignore "SYNC_IGNORE_1_TO_2" "$rel"
       else
-        skip_ignore_msg "WSL→Windows" "$rel"
+        skip_ignore_msg "root 1→root 2" "$rel"
       fi
       return 0
     fi
-    copy_file "$wsl_f" "$win_f" "WSL -> Windows ($rel)"
+    copy_file "$root1_f" "$root2_f" "root 1 -> root 2 ($rel)"
     return 0
   fi
 
-  if [[ ! -f "$wsl_f" && -f "$win_f" ]]; then
-    if rel_blocked_win_to_wsl "$rel"; then
+  if [[ ! -f "$root1_f" && -f "$root2_f" ]]; then
+    if rel_blocked_2_to_1 "$rel"; then
       if [[ $DRY_RUN -eq 1 ]]; then
-        dry_run_skip_ignore "SYNC_IGNORE_WIN_TO_WSL" "$rel"
+        dry_run_skip_ignore "SYNC_IGNORE_2_TO_1" "$rel"
       else
-        skip_ignore_msg "WIN→WSL" "$rel"
+        skip_ignore_msg "root 2→root 1" "$rel"
       fi
       return 0
     fi
-    copy_file "$win_f" "$wsl_f" "Windows -> WSL ($rel)"
+    copy_file "$root2_f" "$root1_f" "root 2 -> root 1 ($rel)"
     return 0
   fi
 
-  if bytes_identical "$wsl_f" "$win_f"; then
+  if bytes_identical "$root1_f" "$root2_f"; then
     return 0
   fi
-  if text_same_ignoring_cr "$wsl_f" "$win_f"; then
-    if [[ $NORMALIZE_LF -eq 1 ]] && should_normalize_lf "$wsl_f"; then
+  if text_same_ignoring_cr "$root1_f" "$root2_f"; then
+    if [[ $NORMALIZE_LF -eq 1 ]] && should_normalize_lf "$root1_f"; then
       local ma mb src tmp label
-      ma=$(mtime "$wsl_f")
-      mb=$(mtime "$win_f")
+      ma=$(mtime "$root1_f")
+      mb=$(mtime "$root2_f")
       if [[ $ma -ge $mb ]]; then
-        src=$wsl_f
-        label="EOL normalize (from WSL mtime) -> both ($rel)"
+        src=$root1_f
+        label="EOL normalize (from root 1 mtime) -> both ($rel)"
       else
-        src=$win_f
-        label="EOL normalize (from Windows mtime) -> both ($rel)"
+        src=$root2_f
+        label="EOL normalize (from root 2 mtime) -> both ($rel)"
       fi
-      if [[ "$src" == "$win_f" ]] && rel_blocked_win_to_wsl "$rel"; then
+      if [[ "$src" == "$root2_f" ]] && rel_blocked_2_to_1 "$rel"; then
         if [[ $DRY_RUN -eq 1 ]]; then
-          dry_run_skip_ignore "SYNC_IGNORE_WIN_TO_WSL" "$rel"
+          dry_run_skip_ignore "SYNC_IGNORE_2_TO_1" "$rel"
         else
-          skip_ignore_msg "WIN→WSL (LF-normalize)" "$rel"
+          skip_ignore_msg "root 2→root 1 (LF-normalize)" "$rel"
         fi
         return 0
       fi
-      if [[ "$src" == "$wsl_f" ]] && rel_blocked_wsl_to_win "$rel"; then
+      if [[ "$src" == "$root1_f" ]] && rel_blocked_1_to_2 "$rel"; then
         if [[ $DRY_RUN -eq 1 ]]; then
-          dry_run_skip_ignore "SYNC_IGNORE_WSL_TO_WIN" "$rel"
+          dry_run_skip_ignore "SYNC_IGNORE_1_TO_2" "$rel"
         else
-          skip_ignore_msg "WSL→Windows (LF-normalize)" "$rel"
+          skip_ignore_msg "root 1→root 2 (LF-normalize)" "$rel"
         fi
         return 0
       fi
       if [[ $DRY_RUN -eq 1 ]]; then
-        printf '[dry-run] %s: LF-normalize %s -> %s and %s\n' "$label" "$src" "$wsl_f" "$win_f"
+        printf '[dry-run] %s: LF-normalize %s -> %s and %s\n' "$label" "$src" "$root1_f" "$root2_f"
       else
         ensure_mutating_sync_consent
         tmp=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-rules.XXXXXX")
         sed 's/\r$//' < "$src" > "$tmp"
-        cp -f -- "$tmp" "$wsl_f"
-        cp -f -- "$tmp" "$win_f"
+        cp -f -- "$tmp" "$root1_f"
+        cp -f -- "$tmp" "$root2_f"
         rm -f -- "$tmp"
-        touch -r "$src" "$wsl_f" 2>/dev/null || true
-        touch -r "$src" "$win_f" 2>/dev/null || true
+        touch -r "$src" "$root1_f" 2>/dev/null || true
+        touch -r "$src" "$root2_f" 2>/dev/null || true
         echo "normalized: $label"
       fi
     else
@@ -678,74 +681,74 @@ sync_one() {
   fi
 
   local ma mb diff_t
-  ma=$(mtime "$wsl_f")
-  mb=$(mtime "$win_f")
+  ma=$(mtime "$root1_f")
+  mb=$(mtime "$root2_f")
   diff_t=$(( ma > mb ? ma - mb : mb - ma ))
 
   if [[ $diff_t -gt $TIE_SEC ]]; then
     if [[ $ma -gt $mb ]]; then
-      if rel_blocked_wsl_to_win "$rel"; then
+      if rel_blocked_1_to_2 "$rel"; then
         if [[ $DRY_RUN -eq 1 ]]; then
-          dry_run_skip_ignore "SYNC_IGNORE_WSL_TO_WIN" "$rel"
+          dry_run_skip_ignore "SYNC_IGNORE_1_TO_2" "$rel"
         else
-          skip_ignore_msg "WSL→Windows" "$rel"
+          skip_ignore_msg "root 1→root 2" "$rel"
         fi
         return 0
       fi
-      copy_file "$wsl_f" "$win_f" "WSL newer -> Windows ($rel)"
+      copy_file "$root1_f" "$root2_f" "root 1 newer -> root 2 ($rel)"
     else
-      if rel_blocked_win_to_wsl "$rel"; then
+      if rel_blocked_2_to_1 "$rel"; then
         if [[ $DRY_RUN -eq 1 ]]; then
-          dry_run_skip_ignore "SYNC_IGNORE_WIN_TO_WSL" "$rel"
+          dry_run_skip_ignore "SYNC_IGNORE_2_TO_1" "$rel"
         else
-          skip_ignore_msg "WIN→WSL" "$rel"
+          skip_ignore_msg "root 2→root 1" "$rel"
         fi
         return 0
       fi
-      copy_file "$win_f" "$wsl_f" "Windows newer -> WSL ($rel)"
+      copy_file "$root2_f" "$root1_f" "root 2 newer -> root 1 ($rel)"
     fi
     return 0
   fi
 
   if [[ $DRY_RUN -eq 1 ]]; then
     echo "[dry-run] conflict (mtime tie within --tie-sec, content differs): $rel" >&2
-    echo "[dry-run]   WSL:      $wsl_f" >&2
-    echo "[dry-run]   Windows:  $win_f" >&2
-    echo "[dry-run]   Would prompt (keep WSL / keep Windows / skip); skipping - leaving both files unchanged." >&2
+    echo "[dry-run]   root 1: $root1_f" >&2
+    echo "[dry-run]   root 2: $root2_f" >&2
+    echo "[dry-run]   Would prompt (keep root 1 / keep root 2 / skip); skipping - leaving both files unchanged." >&2
     echo "[dry-run]   Hint: run without --dry-run to choose, or adjust mtimes / use --tie-sec so the newer side wins." >&2
     return 0
   fi
 
   local winner
-  if ! winner=$(resolve_conflict "$rel" "$wsl_f" "$win_f"); then
+  if ! winner=$(resolve_conflict "$rel" "$root1_f" "$root2_f"); then
     return 0
   fi
   [[ -n "$winner" ]] || return 0
 
-  if [[ "$winner" == "$wsl_f" ]]; then
-    if rel_blocked_wsl_to_win "$rel"; then
-      printf 'refused: resolved to WSL but SYNC_IGNORE_WSL_TO_WIN blocks copy to Windows: %s\n' "$rel" >&2
+  if [[ "$winner" == "$root1_f" ]]; then
+    if rel_blocked_1_to_2 "$rel"; then
+      printf 'refused: chose root 1 but SYNC_IGNORE_1_TO_2 blocks copy to root 2: %s\n' "$rel" >&2
       return 0
     fi
-    copy_file "$wsl_f" "$win_f" "resolved WSL -> Windows ($rel)"
+    copy_file "$root1_f" "$root2_f" "resolved root 1 -> root 2 ($rel)"
   else
-    if rel_blocked_win_to_wsl "$rel"; then
-      printf 'refused: resolved to Windows but SYNC_IGNORE_WIN_TO_WSL blocks copy to WSL: %s\n' "$rel" >&2
+    if rel_blocked_2_to_1 "$rel"; then
+      printf 'refused: chose root 2 but SYNC_IGNORE_2_TO_1 blocks copy to root 1: %s\n' "$rel" >&2
       return 0
     fi
-    copy_file "$win_f" "$wsl_f" "resolved Windows -> WSL ($rel)"
+    copy_file "$root2_f" "$root1_f" "resolved root 2 -> root 1 ($rel)"
   fi
 }
 
-echo "WSL root:     $WSL_ROOT"
-[[ "$WSL_CFG" != "$WSL_ROOT" ]] && echo "  (from $WSL_CFG)"
-echo "Windows root: $WIN_ROOT"
-[[ "$WIN_CFG" != "$WIN_ROOT" ]] && echo "  (from $WIN_CFG)"
+echo "Cursor root 1: $ROOT1"
+[[ "$ROOT1_CFG" != "$ROOT1" ]] && echo "  (from $ROOT1_CFG)"
+echo "Cursor root 2: $ROOT2"
+[[ "$ROOT2_CFG" != "$ROOT2" ]] && echo "  (from $ROOT2_CFG)"
 echo "Scope:        rules/ agents/ skills/"
 [[ $NORMALIZE_LF -eq 1 ]] && echo "Normalize:    LF strip on copy for .md/.mdc/.json/.yaml/.txt"
 [[ $DRY_RUN -eq 1 ]] && echo "Mode:         dry-run"
-maybe_warn_drvfs "$WSL_ROOT" "WSL"
-maybe_warn_drvfs "$WIN_ROOT" "Windows"
+maybe_warn_drvfs "$ROOT1" "root 1"
+maybe_warn_drvfs "$ROOT2" "root 2"
 echo
 
 ensure_pre_sync_consent_if_needed
@@ -756,11 +759,11 @@ done
 
 git_preview_staged_diffs() {
   local root name
-  for root in "$WSL_ROOT" "$WIN_ROOT"; do
-    if [[ "$root" == "$WSL_ROOT" ]]; then
-      name="WSL"
+  for root in "$ROOT1" "$ROOT2"; do
+    if [[ "$root" == "$ROOT1" ]]; then
+      name="root 1"
     else
-      name="Windows"
+      name="root 2"
     fi
     if [[ ! -d "$root/.git" ]]; then
       echo "=== git preview ($name): not a git repo — skip ==="
@@ -866,8 +869,8 @@ fi
 if [[ $COMMIT_PUSH -eq 1 ]] && [[ $SKIP_GIT_COMMIT_PUSH -eq 0 ]]; then
   echo
   echo "=== git commit/push (rules, agents, skills, gitignore/attributes) ==="
-  git_commit_push_one "$WSL_ROOT" "WSL" || true
-  git_commit_push_one "$WIN_ROOT" "Windows" || true
+  git_commit_push_one "$ROOT1" "root 1" || true
+  git_commit_push_one "$ROOT2" "root 2" || true
 fi
 
 echo
