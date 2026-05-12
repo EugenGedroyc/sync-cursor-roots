@@ -61,6 +61,17 @@ SYNC_SUBDIRS=(rules agents skills)
 
 die() { echo "error: $*" >&2; exit 1; }
 
+# GNU diffutils 3.4+: color when stdout is a tty (--color=auto). Ignored on older diff.
+DIFF_COLOR_FLAG=()
+if diff --color=auto -u /dev/null /dev/null >/dev/null 2>&1; then
+  DIFF_COLOR_FLAG=(--color=auto)
+fi
+
+# Unified diff with CRLF ignored; optional color (see DIFF_COLOR_FLAG).
+diff_unified() {
+  diff "${DIFF_COLOR_FLAG[@]}" -u --strip-trailing-cr "$@" || true
+}
+
 # Prompt on /dev/tty; empty or y/yes => 0 (yes); n/no => 1 (no). Loops on invalid input.
 confirm_default_yes() {
   local msg="$1" ans
@@ -162,7 +173,7 @@ diff_copy_to_dest() {
   local dest="$1" src="$2" old_label="$3" new_label="$4"
   local dest_use="$dest"
   [[ -f "$dest" ]] || dest_use=/dev/null
-  diff -u --strip-trailing-cr -L "$old_label" -L "$new_label" "$dest_use" "$src" || true
+  diff_unified -L "$old_label" -L "$new_label" "$dest_use" "$src"
 }
 
 show_planned_sync_diffs() {
@@ -189,11 +200,11 @@ show_planned_sync_diffs() {
     tmp=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-rules.pre-diff.XXXXXX")
     sed 's/\r$//' < "$src" > "$tmp"
     if ! cmp -s "$wsl_f" "$tmp" 2>/dev/null; then
-      diff -u --strip-trailing-cr -L "WSL (current): $wsl_f" -L "normalized (proposal)" "$wsl_f" "$tmp" || true
+      diff_unified -L "WSL (current): $wsl_f" -L "normalized (proposal)" "$wsl_f" "$tmp"
       echo
     fi
     if ! cmp -s "$win_f" "$tmp" 2>/dev/null; then
-      diff -u --strip-trailing-cr -L "Windows (current): $win_f" -L "normalized (proposal)" "$win_f" "$tmp" || true
+      diff_unified -L "Windows (current): $win_f" -L "normalized (proposal)" "$win_f" "$tmp"
       echo
     fi
     rm -f -- "$tmp"
@@ -204,7 +215,7 @@ show_planned_sync_diffs() {
     win_f="$WIN_ROOT/$rel"
     echo "=== mtime tie / conflict (--tie-sec $TIE_SEC): $rel ==="
     if [[ -f "$wsl_f" && -f "$win_f" ]]; then
-      diff -u --strip-trailing-cr -L "WSL: $wsl_f" -L "Windows: $win_f" "$wsl_f" "$win_f" || true
+      diff_unified -L "WSL: $wsl_f" -L "Windows: $win_f" "$wsl_f" "$win_f"
     else
       echo "(cannot diff: missing file)"
     fi
@@ -453,7 +464,11 @@ resolve_conflict() {
       3) return 1 ;;
       d|D)
         if [[ -f "$wsl_f" && -f "$win_f" ]]; then
-          diff -u --strip-trailing-cr "$wsl_f" "$win_f" | sed -n '1,200p' >&2 || true
+          if ((${#DIFF_COLOR_FLAG[@]})); then
+            diff --color=always -u --strip-trailing-cr "$wsl_f" "$win_f" | sed -n '1,200p' >&2 || true
+          else
+            diff -u --strip-trailing-cr "$wsl_f" "$win_f" | sed -n '1,200p' >&2 || true
+          fi
         else
           echo >&2 "(cannot diff: missing file)"
         fi
@@ -606,7 +621,7 @@ git_preview_staged_diffs() {
         echo "=== git preview ($name): nothing staged after add (rules, agents, skills, gitignore/attributes) ==="
       else
         echo "=== git preview ($name): git diff --cached (same paths as commit) ==="
-        git diff --cached || true
+        git --no-pager diff --cached --color=auto || true
       fi
       git reset HEAD -- .gitignore .gitattributes "${SYNC_SUBDIRS[@]}" 2>/dev/null || true
     )
@@ -652,7 +667,7 @@ git_commit_push_one() {
     fi
     if [[ $DRY_RUN -eq 1 ]]; then
       echo "[dry-run] git ($name): would commit and push with message: $msg"
-      git diff --cached --stat || true
+      git --no-pager diff --cached --stat --color=auto || true
       exit 0
     fi
     set +e
