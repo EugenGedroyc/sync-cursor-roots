@@ -46,7 +46,7 @@
 #   --root-2 PATH              Cursor root 2 (default: $CURSOR_ROOT_2; required if unset)
 #   --tie-sec N                If |mtime_a-mtime_b| <= N and content differs, prompt (default: 0)
 #   --normalize-lf             When copying, strip CR for common text extensions (see script)
-#   --verbose                  Log skips for CRLF-only differences
+#   --verbose                  Log skips for CRLF-only diffs on extensions we do not LF-normalize
 #   -h, --help                 Show help
 #
 # Interactive prompts (tty; use -y/--yes if unavailable):
