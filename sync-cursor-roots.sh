@@ -10,7 +10,7 @@
 #   extensions (.md/.mdc/.json/.yaml/.txt). Keep .gitattributes with eol=lf for those paths.
 #
 # Usage:
-#   sync-cursor-rules.sh [options]
+#   sync-cursor-roots.sh [options]
 #
 # Assumptions:
 #   Each .cursor root should live inside a git repo if you use --commit-push.
@@ -311,7 +311,7 @@ show_planned_sync_diffs() {
     root2_f="$ROOT2/$rel"
     src=$(normalize_src_for_pair "$root1_f" "$root2_f")
     echo "=== LF-normalize → both: $rel (chosen src: $src) ==="
-    tmp=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-rules.pre-diff.XXXXXX")
+    tmp=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-roots.pre-diff.XXXXXX")
     sed 's/\r$//' < "$src" > "$tmp"
     if ! cmp -s "$root1_f" "$tmp" 2>/dev/null; then
       diff_unified -L "root 1 (current): $root1_f" -L "normalized (proposal)" "$root1_f" "$tmp"
@@ -553,7 +553,7 @@ copy_file() {
   ensure_mutating_sync_consent
   mkdir -p "$(dirname "$dest")"
   if [[ $NORMALIZE_LF -eq 1 ]] && should_normalize_lf "$src"; then
-    tmp=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-rules.XXXXXX")
+    tmp=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-roots.XXXXXX")
     sed 's/\r$//' < "$src" > "$tmp"
     mv -f -- "$tmp" "$dest"
     touch -r "$src" "$dest" 2>/dev/null || true
@@ -665,7 +665,7 @@ sync_one() {
         printf '[dry-run] %s: LF-normalize %s -> %s and %s\n' "$label" "$src" "$root1_f" "$root2_f"
       else
         ensure_mutating_sync_consent
-        tmp=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-rules.XXXXXX")
+        tmp=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-roots.XXXXXX")
         sed 's/\r$//' < "$src" > "$tmp"
         cp -f -- "$tmp" "$root1_f"
         cp -f -- "$tmp" "$root2_f"
