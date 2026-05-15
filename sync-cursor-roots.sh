@@ -41,7 +41,7 @@
 #   --commit-push              After sync, git add/commit/push (rules/, agents/, skills/,
 #                              gitignore, gitattributes). When not --dry-run, prompts before commit/push
 #                              unless -y/--yes.
-#   -m, --message TEXT         Commit message (default: auto)
+#   -m, --message TEXT         Commit message (default: Cursor agent proposes one)
 #   --root-1 PATH              Cursor root 1 (default: $CURSOR_ROOT_1 or $HOME/.cursor)
 #   --root-2 PATH              Cursor root 2 (default: $CURSOR_ROOT_2; required if unset)
 #   --tie-sec N                If |mtime_a-mtime_b| <= N and content differs, prompt (default: 0)
@@ -773,6 +773,51 @@ for rel in "${PATHS_SORTED[@]+"${PATHS_SORTED[@]}"}"; do
   sync_one "$rel"
 done
 
+# Uses Cursor Agent headless output (--print); prefers standalone `agent`, else `cursor agent`.
+# Reads staged diff from disk so large patches do not overflow argv limits.
+git_commit_msg_via_cursor_agent() {
+  local repo_root="$1"
+  local diff_file prompt agent_output line
+  diff_file=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-roots.staged-diff.XXXXXX")
+  if ! git -C "$repo_root" diff --cached >"$diff_file" 2>/dev/null; then
+    rm -f -- "$diff_file"
+    return 1
+  fi
+  prompt="Read the UTF-8 unified git diff at this absolute path:
+$diff_file
+
+It is the current staged diff for this repo (Cursor rules/agents/skills under .cursor).
+
+Output ONLY a git commit message following Conventional Commits:
+- First line MUST be the subject: type(scope): imperative, lowercase description (about 72 chars or less).
+- Use types such as chore, feat, fix, docs, refactor when appropriate; scope \"cursor\" unless something narrower fits.
+- Do not add a body unless necessary; prefer subject line only.
+- No markdown fences, no quotation marks around the message, no preamble or explanation — only the commit message text."
+
+  if command -v agent >/dev/null 2>&1; then
+    agent_output="$(agent --print --trust --mode ask --workspace "$repo_root" "$prompt")" || agent_output=""
+  elif command -v cursor >/dev/null 2>&1; then
+    agent_output="$(cursor agent --print --trust --mode ask --workspace "$repo_root" "$prompt")" || agent_output=""
+  else
+    rm -f -- "$diff_file"
+    echo "warning: neither 'agent' nor 'cursor' on PATH; using fallback commit message" >&2
+    return 1
+  fi
+  rm -f -- "$diff_file"
+
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=$(trim "$line")
+    [[ -z "$line" ]] && continue
+    [[ "$line" == \`\`\`* ]] && continue
+    [[ "$line" == \`\`\` ]] && continue
+    printf '%s\n' "$line"
+    return 0
+  done <<<"$agent_output"
+
+  echo "warning: Cursor agent returned no usable commit subject line; using fallback message" >&2
+  return 1
+}
+
 git_preview_staged_diffs() {
   local root name
   for root in "$ROOT1" "$ROOT2"; do
@@ -852,7 +897,11 @@ git_commit_push_one() {
     fi
     local msg="$COMMIT_MSG"
     if [[ -z "$msg" ]]; then
-      msg="chore(cursor): sync rules, agents, and skills"
+      if [[ $DRY_RUN -eq 1 ]]; then
+        msg="(dry-run: would run Cursor agent --print --mode ask to propose Conventional Commits message)"
+      elif ! msg=$(git_commit_msg_via_cursor_agent "$root"); then
+        msg="chore(cursor): sync rules, agents, and skills"
+      fi
     fi
     if [[ $DRY_RUN -eq 1 ]]; then
       echo "[dry-run] git ($name): would commit and push with message: $msg"
