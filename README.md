@@ -62,3 +62,5 @@ Full flags: `./sync-cursor-roots.sh --help`.
 ## Line endings
 
 If the **only** difference is CRLF vs LF (common across Linux vs Windows/9p mounts), paths like `.md`/`.mdc`/`.json`/`.yaml`/`.txt` are LF-normalized on **both** roots automatically. You do not need `--normalize-lf` for that case. Pass `--normalize-lf` when you also want CR stripped on ordinary copies where content differs.
+
+Before `--commit-push` runs `git add`, the same text types under `rules/`, `agents/`, and `skills/` are LF-normalized in the working tree so Git does not warn about CRLF vs `.gitattributes` `eol=lf`.

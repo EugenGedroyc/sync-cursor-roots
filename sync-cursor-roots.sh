@@ -8,7 +8,8 @@
 # - Working-tree bytes can still be CRLF on one side; comparisons treat CRLF vs LF as equal
 #   (diff --strip-trailing-cr). Text extensions auto LF-normalize on both roots when only EOL
 #   differs (no --normalize-lf needed). Use --normalize-lf to strip CR on content-changing copies.
-#   Keep .gitattributes with eol=lf for those paths.
+#   Keep .gitattributes with eol=lf for those paths. --commit-push LF-normalizes scoped
+#   text in the working tree before git add so CRLF-on-drvfs files do not warn.
 #
 # Usage:
 #   sync-cursor-roots.sh [options]
@@ -509,6 +510,22 @@ should_normalize_lf() {
   esac
 }
 
+# Strip CR from scoped text files in the working tree (cwd = repo root). Avoids git add
+# "CRLF will be replaced by LF" warnings when .gitattributes sets eol=lf on 9p/drvfs mounts.
+normalize_lf_in_sync_scope() {
+  local sub f tmp
+  for sub in "${SYNC_SUBDIRS[@]}"; do
+    [[ -d "$sub" ]] || continue
+    while IFS= read -r -d '' f; do
+      should_normalize_lf "$f" || continue
+      grep -q $'\r' "$f" 2>/dev/null || continue
+      tmp=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-roots.XXXXXX")
+      sed 's/\r$//' < "$f" > "$tmp"
+      mv -f -- "$tmp" "$f"
+    done < <(find "$sub" -type f -print0 2>/dev/null)
+  done
+}
+
 collect_relpaths() {
   local root="$1"
   local sub
@@ -836,6 +853,7 @@ git_preview_staged_diffs() {
       if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
         exit 0
       fi
+      normalize_lf_in_sync_scope
       local f sub
       for f in .gitignore .gitattributes; do
         if [[ -f "$f" ]]; then
@@ -875,6 +893,7 @@ git_commit_push_one() {
       echo "skip git ($name): $root"
       exit 0
     fi
+    normalize_lf_in_sync_scope
     for f in .gitignore .gitattributes; do
       if [[ -f "$f" ]]; then
         git add -- "$f"
