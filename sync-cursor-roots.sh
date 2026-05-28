@@ -52,7 +52,7 @@
 #
 # Interactive prompts (tty; use -y/--yes if unavailable):
 #   Do you want to continue? [Y/n/d] — before mutating sync (impact summary first).
-#   Y / empty / yes: proceed; n / no: exit 0; d: full unified diffs, then re-prompt.
+#   Y / empty / yes: proceed; n / no: exit 0; d: full unified diffs in less -R, then re-prompt.
 #   Proceed with git commit and push? [Y/n/d] — same; d runs a per-root staged diff preview.
 
 set -euo pipefail
@@ -112,8 +112,26 @@ if diff --color=auto -u /dev/null /dev/null >/dev/null 2>&1; then
 fi
 
 # Unified diff with CRLF ignored; optional color (see DIFF_COLOR_FLAG).
+# SYNC_DIFF_PAGER=1 (set by pager_show_diff): force color for a pipe into less -R.
 diff_unified() {
-  diff "${DIFF_COLOR_FLAG[@]}" -u --strip-trailing-cr "$@" || true
+  local color_flag=("${DIFF_COLOR_FLAG[@]}")
+  if [[ -n "${SYNC_DIFF_PAGER:-}" ]] && ((${#DIFF_COLOR_FLAG[@]})); then
+    color_flag=(--color=always)
+  fi
+  diff "${color_flag[@]}" -u --strip-trailing-cr "$@" || true
+}
+
+# Run show_diff_cmd through less (colors preserved via SYNC_DIFF_PAGER + less -R).
+pager_show_diff() {
+  local show_diff_cmd="$1" tmp
+  tmp=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-roots.diff.XXXXXX")
+  SYNC_DIFF_PAGER=1 "$show_diff_cmd" >"$tmp" 2>&1 || true
+  if command -v less >/dev/null 2>&1; then
+    less -R "$tmp" </dev/tty >/dev/tty 2>/dev/tty || true
+  else
+    cat "$tmp" >/dev/tty 2>/dev/tty || cat "$tmp"
+  fi
+  rm -f -- "$tmp"
 }
 
 # Prompt on /dev/tty; empty or y/yes => 0 (yes); n/no => 1 (no). Loops on invalid input.
@@ -148,7 +166,7 @@ confirm_default_yes_with_diff() {
     case "${ans:-}" in
       '' | [yY] | [yY][eE][sS]) return 0 ;;
       [nN] | [nN][oO]) return 1 ;;
-      d|D) "$show_diff_cmd" ;;
+      d|D) pager_show_diff "$show_diff_cmd" ;;
       *) printf 'Please answer y, n, or d (default yes).\n' >/dev/tty ;;
     esac
   done
@@ -873,7 +891,11 @@ git_preview_staged_diffs() {
         echo "=== git preview ($name): nothing staged after add (rules, agents, skills, gitignore/attributes) ==="
       else
         echo "=== git preview ($name): git diff --cached (same paths as commit) ==="
-        git --no-pager diff --cached --color=auto || true
+        if [[ -n "${SYNC_DIFF_PAGER:-}" ]]; then
+          git --no-pager diff --cached --color=always || true
+        else
+          git --no-pager diff --cached --color=auto || true
+        fi
       fi
       git reset HEAD -- .gitignore .gitattributes "${SYNC_SUBDIRS[@]}" 2>/dev/null || true
     )
