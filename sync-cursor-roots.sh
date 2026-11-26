@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 # Sync Cursor rules/, agents/, and skills/ between two .cursor roots (see CURSOR_ROOT_1 / CURSOR_ROOT_2).
+# Also syncs optional project-level pairs (see SYNC_PROJECTS / --project).
 # Uses newer mtime when content differs; prompts when mtimes tie (or with --tie-sec).
 #
 # Cross-filesystem / line endings (QA):
@@ -10,6 +11,8 @@
 #   differs (no --normalize-lf needed). Use --normalize-lf to strip CR on content-changing copies.
 #   Keep .gitattributes with eol=lf for those paths. --commit-push LF-normalizes scoped
 #   text in the working tree before git add so CRLF-on-drvfs files do not warn.
+# - Paths may be Git Bash C:/... or /c/... (backslashes are accepted). Avoid mixing forms
+#   inside one entry; the script canonicalizes existing directories via pwd -P.
 #
 # Usage:
 #   sync-cursor-roots.sh [options]
@@ -17,21 +20,34 @@
 # Assumptions:
 #   Each .cursor root should live inside a git repo if you use --commit-push.
 #   The script runs git add/commit/push from that root for rules/, agents/, skills/,
-#   .gitignore, and .gitattributes. Roots without .git are skipped for git.
+#   .gitignore, and .gitattributes, plus any SYNC_EXTRA_ITEMS. Project pairs are not
+#   staged by --commit-push. Roots without .git are skipped for git.
 #
 # Environment (optional: $SCRIPT_DIR/.env, or a file named by SYNC_ENV_FILE):
 #   SYNC_ENV_FILE              If set and this path is readable, source it (set -a); otherwise, if
 #                              $SCRIPT_DIR/.env is readable, source that. No other paths are loaded.
 #   CURSOR_ROOT_1              First .cursor root directory (default: $HOME/.cursor if unset).
 #   CURSOR_ROOT_2              Second .cursor root directory (required: set in .env or pass --root-2).
-#   SYNC_IGNORE_2_TO_1         Colon-separated repo-relative paths (e.g. rules/a.mdc); skip any
-#                              copy or LF-normalize that would write root 2 bytes into root 1.
-#   SYNC_IGNORE_1_TO_2         Same for paths; skip copies/normalize that would write root 1 bytes
-#                              into root 2. Non-empty shell exports for the two SYNC_IGNORE_* variables
+#   SYNC_IGNORE_2_TO_1         Colon-separated paths; skip any copy or LF-normalize that would write
+#                              root 2 bytes into root 1. Global keys stay repo-relative (rules/a.mdc).
+#                              Project keys are projects/<name>/<rel>, e.g. projects/my-app/rules/x.mdc.
+#   SYNC_IGNORE_1_TO_2         Same shape, blocking root 1 → root 2. Non-empty shell exports for
+#                              SYNC_IGNORE_*, SYNC_PROJECTS, SYNC_PROJECT_ITEMS, and SYNC_EXTRA_ITEMS
 #                              win over values from the file (see README).
+#   SYNC_PROJECTS              Project pairs name|side1|side2, separated by newlines or semicolons.
+#                              side1/side2 are that project's .cursor dir on each side (side 2 may be
+#                              a folder in a settings repo and need not be named .cursor). Blank lines
+#                              and lines starting with # are ignored. A later --project with the same
+#                              name overrides the file entry.
+#   SYNC_PROJECT_ITEMS         Items synced inside each project pair (comma, semicolon, or whitespace).
+#                              A trailing slash, or a bare name with no dot, is a directory tree; any
+#                              other entry is one file. Default:
+#                              rules/,skills/,commands/,agents/,mcp.json,hooks.json,BUGBOT.md
+#   SYNC_EXTRA_ITEMS           Optional items added to the global roots only (same syntax). Default
+#                              empty, so commands/, mcp.json, and hooks.json stay out of the global sync.
 #
 # Options:
-#   --dry-run                  Print planned actions only; no copies or git writes.
+#   --dry-run                  Print planned actions only; no copies, mkdir, or git writes.
 #                              No interactive prompts. When mtimes tie within --tie-sec
 #                              but content differs, prints [dry-run] conflict lines and
 #                              skips (no prompt).
@@ -39,16 +55,23 @@
 #                              before git commit/push. Does not change conflict resolution:
 #                              mtime ties with differing content still use the interactive
 #                              menu unless --dry-run (which skips those conflicts).
-#   --commit-push              After sync, git add/commit/push (rules/, agents/, skills/,
-#                              gitignore, gitattributes). When not --dry-run, prompts before commit/push
-#                              unless -y/--yes.
+#   --commit-push              After sync, git add/commit/push for the global scope only
+#                              (rules/, agents/, skills/, SYNC_EXTRA_ITEMS, gitignore, gitattributes).
+#                              When not --dry-run, prompts before commit/push unless -y/--yes.
 #   -m, --message TEXT         Commit message (default: Cursor agent proposes one)
 #   --root-1 PATH              Cursor root 1 (default: $CURSOR_ROOT_1 or $HOME/.cursor)
 #   --root-2 PATH              Cursor root 2 (default: $CURSOR_ROOT_2; required if unset)
+#   --project SPEC             Project pair name|side1|side2 (repeatable). Same name overrides
+#                              SYNC_PROJECTS. Paths may be C:/..., /c/..., or relative.
+#   --projects-only            Sync project pairs only; do not scan global rules/agents/skills.
+#   --no-projects              Do not sync project pairs (global roots only).
 #   --tie-sec N                If |mtime_a-mtime_b| <= N and content differs, prompt (default: 0)
 #   --normalize-lf             When copying, strip CR for common text extensions (see script)
 #   --verbose                  Log skips for CRLF-only diffs on extensions we do not LF-normalize
 #   -h, --help                 Show help
+#
+# Project paths: if neither side exists, or a side exists and is not a directory, the script warns
+# and skips that pair. If only one side exists, it creates the missing directory (unless --dry-run).
 #
 # Interactive prompts (tty; use -y/--yes if unavailable):
 #   Do you want to continue? [Y/n/d] — before mutating sync (impact summary first).
@@ -59,7 +82,8 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
-# Optional .env: export all assigned vars. Pre-set SYNC_IGNORE_* in the shell to override file values.
+# Optional .env: export all assigned vars. Non-empty pre-set SYNC_IGNORE_*, SYNC_PROJECTS,
+# SYNC_PROJECT_ITEMS, and SYNC_EXTRA_ITEMS in the shell win over the file.
 load_sync_env_file() {
   local env_path=""
   if [[ -n "${SYNC_ENV_FILE-}" ]]; then
@@ -70,9 +94,12 @@ load_sync_env_file() {
     env_path="$SCRIPT_DIR/.env"
   fi
   [[ -z "$env_path" ]] && return 0
-  local _pre_1_to_2 _pre_2_to_1
+  local _pre_1_to_2 _pre_2_to_1 _pre_projects _pre_pitems _pre_extras
   _pre_1_to_2="${SYNC_IGNORE_1_TO_2-}"
   _pre_2_to_1="${SYNC_IGNORE_2_TO_1-}"
+  _pre_projects="${SYNC_PROJECTS-}"
+  _pre_pitems="${SYNC_PROJECT_ITEMS-}"
+  _pre_extras="${SYNC_EXTRA_ITEMS-}"
   set -a
   # shellcheck disable=SC1090
   source "$env_path"
@@ -83,6 +110,15 @@ load_sync_env_file() {
   fi
   if [[ -n "$_pre_2_to_1" ]]; then
     SYNC_IGNORE_2_TO_1="$_pre_2_to_1"
+  fi
+  if [[ -n "$_pre_projects" ]]; then
+    SYNC_PROJECTS="$_pre_projects"
+  fi
+  if [[ -n "$_pre_pitems" ]]; then
+    SYNC_PROJECT_ITEMS="$_pre_pitems"
+  fi
+  if [[ -n "$_pre_extras" ]]; then
+    SYNC_EXTRA_ITEMS="$_pre_extras"
   fi
 }
 
@@ -100,8 +136,22 @@ ROOT2="${CURSOR_ROOT_2:-}"
 # Set to 1 after the first successful mutating-sync confirmation (copies / LF-normalize to both).
 SYNC_WRITE_CONSENTED=0
 SKIP_GIT_COMMIT_PUSH=0
-# Basenames under each .cursor root to scan for files and to stage on --commit-push.
-SYNC_SUBDIRS=(rules agents skills)
+# Global scope. Directory items end with /. SYNC_EXTRA_ITEMS is appended after argument parsing.
+GLOBAL_ITEMS=(rules/ agents/ skills/)
+PROJECT_ITEMS=()
+DO_GLOBAL=1
+DO_PROJECTS=1
+CLI_PROJECTS=()
+PROJECT_ORDER=()
+ACTIVE_PROJECTS=()
+PROJECT_DIRS_TO_CREATE=()
+GIT_SCOPE_LABEL="rules, agents, skills, gitignore/attributes"
+declare -A PROJECT_PATH1=()
+declare -A PROJECT_PATH2=()
+# Logical relative path (ignore key / display) → pair roots and path under each root.
+declare -A FILE_REL=()
+declare -A FILE_ROOT1=()
+declare -A FILE_ROOT2=()
 
 die() { echo "error: $*" >&2; exit 1; }
 
@@ -238,11 +288,31 @@ normalize_src_for_pair() {
   fi
 }
 
+# Resolve the two files for a logical relative path (global rel, or projects/<name>/<rel>).
+pair_paths() {
+  local logical="$1"
+  local file_rel="$logical"
+  local root1="$ROOT1"
+  local root2="$ROOT2"
+  if [[ -n "${FILE_REL[$logical]+x}" ]]; then
+    file_rel="${FILE_REL[$logical]}"
+  fi
+  if [[ -n "${FILE_ROOT1[$logical]+x}" ]]; then
+    root1="${FILE_ROOT1[$logical]}"
+  fi
+  if [[ -n "${FILE_ROOT2[$logical]+x}" ]]; then
+    root2="${FILE_ROOT2[$logical]}"
+  fi
+  PP_R1="$root1/$file_rel"
+  PP_R2="$root2/$file_rel"
+}
+
 # Populate PLAN_* arrays; mirrors sync_one decisions (DRY_RUN must be off; tie → PLAN_TIE).
 plan_sync_one() {
   local rel="$1"
-  local root1_f="$ROOT1/$rel"
-  local root2_f="$ROOT2/$rel"
+  pair_paths "$rel"
+  local root1_f="$PP_R1"
+  local root2_f="$PP_R2"
 
   if [[ ! -f "$root1_f" && ! -f "$root2_f" ]]; then
     return 0
@@ -323,22 +393,25 @@ diff_copy_to_dest() {
 show_planned_sync_diffs() {
   local rel root1_f root2_f src tmp
   for rel in "${PLAN_COPY_TO_2[@]+"${PLAN_COPY_TO_2[@]}"}"; do
-    root1_f="$ROOT1/$rel"
-    root2_f="$ROOT2/$rel"
+    pair_paths "$rel"
+    root1_f="$PP_R1"
+    root2_f="$PP_R2"
     echo "=== copy → root 2: $rel ==="
     diff_copy_to_dest "$root2_f" "$root1_f" "OLD (root 2: $root2_f)" "NEW (root 1 → root 2: $root1_f)"
     echo
   done
   for rel in "${PLAN_COPY_TO_1[@]+"${PLAN_COPY_TO_1[@]}"}"; do
-    root1_f="$ROOT1/$rel"
-    root2_f="$ROOT2/$rel"
+    pair_paths "$rel"
+    root1_f="$PP_R1"
+    root2_f="$PP_R2"
     echo "=== copy → root 1: $rel ==="
     diff_copy_to_dest "$root1_f" "$root2_f" "OLD (root 1: $root1_f)" "NEW (root 2 → root 1: $root2_f)"
     echo
   done
   for rel in "${PLAN_NORMALIZE[@]+"${PLAN_NORMALIZE[@]}"}"; do
-    root1_f="$ROOT1/$rel"
-    root2_f="$ROOT2/$rel"
+    pair_paths "$rel"
+    root1_f="$PP_R1"
+    root2_f="$PP_R2"
     src=$(normalize_src_for_pair "$root1_f" "$root2_f")
     echo "=== LF-normalize → both: $rel (chosen src: $src) ==="
     tmp=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-roots.pre-diff.XXXXXX")
@@ -355,8 +428,9 @@ show_planned_sync_diffs() {
     echo
   done
   for rel in "${PLAN_TIE[@]+"${PLAN_TIE[@]}"}"; do
-    root1_f="$ROOT1/$rel"
-    root2_f="$ROOT2/$rel"
+    pair_paths "$rel"
+    root1_f="$PP_R1"
+    root2_f="$PP_R2"
     echo "=== mtime tie / conflict (--tie-sec $TIE_SEC): $rel ==="
     if [[ -f "$root1_f" && -f "$root2_f" ]]; then
       diff_unified -L "root 1: $root1_f" -L "root 2: $root2_f" "$root1_f" "$root2_f"
@@ -393,6 +467,11 @@ print_sync_impact_summary() {
     echo "  Mtime tie / conflict within --tie-sec=$TIE_SEC ($nt) — resolve interactively:"
     local r4
     for r4 in "${PLAN_TIE[@]}"; do echo "    $r4"; done
+  fi
+  if ((${#PROJECT_DIRS_TO_CREATE[@]})); then
+    echo "  Create missing project directory (${#PROJECT_DIRS_TO_CREATE[@]}):"
+    local d
+    for d in "${PROJECT_DIRS_TO_CREATE[@]}"; do echo "    $d"; done
   fi
   echo
 }
@@ -461,6 +540,13 @@ while [[ $# -gt 0 ]]; do
       ROOT2="$2"
       shift
       ;;
+    --project)
+      [[ $# -ge 2 ]] || die "--project requires name|path1|path2"
+      CLI_PROJECTS+=("$2")
+      shift
+      ;;
+    --projects-only) DO_GLOBAL=0 ;;
+    --no-projects) DO_PROJECTS=0 ;;
     --tie-sec)
       [[ $# -ge 2 ]] || die "--tie-sec requires a number"
       [[ "$2" =~ ^[0-9]+$ ]] || die "--tie-sec must be a non-negative integer"
@@ -474,6 +560,10 @@ while [[ $# -gt 0 ]]; do
   esac
   shift
 done
+
+if [[ $DO_GLOBAL -eq 0 && $DO_PROJECTS -eq 0 ]]; then
+  die "--projects-only and --no-projects cannot be combined"
+fi
 
 [[ -n "${ROOT2}" ]] || die "CURSOR_ROOT_2 must be set in .env (or SYNC_ENV_FILE) or pass --root-2 PATH"
 [[ -d "$ROOT1" ]] || die "cursor root 1 not a directory: $ROOT1"
@@ -528,66 +618,378 @@ should_normalize_lf() {
   esac
 }
 
+# Strip CR from one working-tree file. Missing CR or a non-text extension is a no-op.
+normalize_lf_file() {
+  local f="$1" tmp
+  should_normalize_lf "$f" || return 0
+  grep -q $'\r' "$f" 2>/dev/null || return 0
+  tmp=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-roots.XXXXXX")
+  sed 's/\r$//' < "$f" > "$tmp"
+  mv -f -- "$tmp" "$f"
+}
+
 # Strip CR from scoped text files in the working tree (cwd = repo root). Avoids git add
 # "CRLF will be replaced by LF" warnings when .gitattributes sets eol=lf on 9p/drvfs mounts.
 normalize_lf_in_sync_scope() {
-  local sub f tmp
-  for sub in "${SYNC_SUBDIRS[@]}"; do
-    [[ -d "$sub" ]] || continue
-    while IFS= read -r -d '' f; do
-      should_normalize_lf "$f" || continue
-      grep -q $'\r' "$f" 2>/dev/null || continue
-      tmp=$(mktemp "${TMPDIR:-/tmp}/sync-cursor-roots.XXXXXX")
-      sed 's/\r$//' < "$f" > "$tmp"
-      mv -f -- "$tmp" "$f"
-    done < <(find "$sub" -type f -print0 2>/dev/null)
+  local item sub f
+  for item in "${GLOBAL_ITEMS[@]}"; do
+    if [[ "$item" == */ ]]; then
+      sub="${item%/}"
+      [[ -d "$sub" ]] || continue
+      while IFS= read -r -d '' f; do
+        normalize_lf_file "$f"
+      done < <(find "$sub" -type f -print0 2>/dev/null)
+    elif [[ -f "$item" ]]; then
+      normalize_lf_file "$item"
+    fi
   done
 }
 
-collect_relpaths() {
+# Item syntax: trailing slash, or a bare name with no dot, is a directory; otherwise a file.
+normalize_item_name() {
+  local s="$1" rest part
+  s="${s//\\//}"
+  [[ -n "$s" ]] || die "empty sync item"
+  if [[ "$s" != */ && "$s" != */* && "$s" != *.* ]]; then
+    s="${s}/"
+  fi
+  if [[ "$s" == /* || "$s" =~ ^[A-Za-z]: ]]; then
+    die "sync item must be relative to the cursor directory: ${s%/}"
+  fi
+  rest="${s%/}"
+  set -f
+  local IFS=/
+  for part in $rest; do
+    if [[ -z "$part" || "$part" == "." || "$part" == ".." ]]; then
+      set +f
+      die "invalid sync item: ${s%/}"
+    fi
+  done
+  set +f
+  printf '%s\n' "$s"
+}
+
+# $1 spec text, $2 nameref of the destination array.
+parse_item_spec_into() {
+  local spec="$1"
+  local -n _dest="$2"
+  local flat part normalized
+  flat="${spec//$'\r'/$'\n'}"
+  flat="${flat//,/$'\n'}"
+  flat="${flat//;/$'\n'}"
+  flat="${flat//$'\t'/$'\n'}"
+  flat="${flat// /$'\n'}"
+  while IFS= read -r part || [[ -n "$part" ]]; do
+    part=$(trim "$part")
+    [[ -z "$part" ]] && continue
+    normalized=$(normalize_item_name "$part")
+    _dest+=("$normalized")
+  done <<<"$flat"
+}
+
+item_in_list() {
+  local needle="$1" x
+  shift
+  for x in "$@"; do
+    [[ "$x" == "$needle" ]] && return 0
+  done
+  return 1
+}
+
+add_project_spec() {
+  local spec="$1" source_label="$2"
+  local name="" path1="" path2="" rest=""
+  local IFS='|'
+  read -r name path1 path2 rest <<<"$spec" || true
+  name=$(trim "$name")
+  path1=$(trim "$path1")
+  path2=$(trim "${path2-}")
+  rest=$(trim "${rest-}")
+  if [[ -n "$rest" || -z "$name" || -z "$path1" || -z "$path2" ]]; then
+    die "project entry must be name|path1|path2 ($source_label: $spec)"
+  fi
+  if [[ ! "$name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+    die "project name must match [A-Za-z0-9._-]+ ($source_label: $name)"
+  fi
+  if [[ -n "${PROJECT_PATH1[$name]+x}" ]]; then
+    echo "note: project '$name' overridden by $source_label" >&2
+  else
+    PROJECT_ORDER+=("$name")
+  fi
+  PROJECT_PATH1[$name]="$path1"
+  PROJECT_PATH2[$name]="$path2"
+}
+
+parse_projects_blob() {
+  local raw="$1" source_label="$2" line
+  [[ -n "$raw" ]] || return 0
+  raw="${raw//$'\r'/}"
+  raw="${raw//;/$'\n'}"
+  while IFS= read -r line || [[ -n "$line" ]]; do
+    line=$(trim "$line")
+    [[ -z "$line" ]] && continue
+    [[ "$line" == \#* ]] && continue
+    add_project_spec "$line" "$source_label"
+  done <<<"$raw"
+}
+
+configure_sync_scope() {
+  local item spec
+  local -a extra_items=()
+  GLOBAL_ITEMS=(rules/ agents/ skills/)
+  if [[ -n "${SYNC_EXTRA_ITEMS-}" ]]; then
+    parse_item_spec_into "$SYNC_EXTRA_ITEMS" extra_items
+    for item in "${extra_items[@]+"${extra_items[@]}"}"; do
+      if item_in_list "$item" "${GLOBAL_ITEMS[@]}"; then
+        continue
+      fi
+      GLOBAL_ITEMS+=("$item")
+    done
+    GIT_SCOPE_LABEL="rules, agents, skills, extra items, gitignore/attributes"
+  fi
+  PROJECT_ITEMS=()
+  if [[ -n "${SYNC_PROJECT_ITEMS-}" ]]; then
+    parse_item_spec_into "$SYNC_PROJECT_ITEMS" PROJECT_ITEMS
+  else
+    parse_item_spec_into "rules/,skills/,commands/,agents/,mcp.json,hooks.json,BUGBOT.md" PROJECT_ITEMS
+  fi
+  if [[ ${#PROJECT_ITEMS[@]} -eq 0 ]]; then
+    die "SYNC_PROJECT_ITEMS did not contain any sync items"
+  fi
+  PROJECT_ORDER=()
+  parse_projects_blob "${SYNC_PROJECTS-}" "SYNC_PROJECTS"
+  for spec in "${CLI_PROJECTS[@]+"${CLI_PROJECTS[@]}"}"; do
+    add_project_spec "$spec" "--project"
+  done
+  if [[ $DO_GLOBAL -eq 0 && ${#PROJECT_ORDER[@]} -eq 0 ]]; then
+    die "no project pairs configured; set SYNC_PROJECTS or pass --project name|path1|path2"
+  fi
+}
+
+# Existing directories become a physical absolute path. Missing paths keep a stable
+# parent+basename form so Git Bash C:/ and /c/ inputs still match find output later.
+canon_path() {
+  local p="$1" parent base canon_parent resolved
+  p="${p//\\//}"
+  while [[ "$p" == */ && ${#p} -gt 1 && "$p" != [A-Za-z]:/ ]]; do
+    p="${p%/}"
+  done
+  if [[ -d "$p" ]]; then
+    canon_parent=$(cd -- "$p" && pwd -P) || canon_parent=""
+    if [[ -n "$canon_parent" ]]; then
+      printf '%s\n' "$canon_parent"
+      return 0
+    fi
+  fi
+  parent=$(dirname -- "$p")
+  base=$(basename -- "$p")
+  if [[ "$parent" != "$p" && -d "$parent" ]]; then
+    canon_parent=$(cd -- "$parent" && pwd -P) || canon_parent=""
+    if [[ -n "$canon_parent" ]]; then
+      printf '%s/%s\n' "$canon_parent" "$base"
+      return 0
+    fi
+  fi
+  resolved=$(readlink -f "$p" 2>/dev/null) || true
+  if [[ -n "$resolved" ]]; then
+    printf '%s\n' "$resolved"
+    return 0
+  fi
+  printf '%s\n' "$p"
+}
+
+prepare_project_pair() {
+  local name="$1"
+  local p1 p2
+  p1=$(canon_path "${PROJECT_PATH1[$name]}")
+  p2=$(canon_path "${PROJECT_PATH2[$name]}")
+  PROJECT_PATH1[$name]="$p1"
+  PROJECT_PATH2[$name]="$p2"
+  if [[ -e "$p1" && ! -d "$p1" ]]; then
+    echo "warning: project '$name': side 1 exists but is not a directory; skipping: $p1" >&2
+    return 1
+  fi
+  if [[ -e "$p2" && ! -d "$p2" ]]; then
+    echo "warning: project '$name': side 2 exists but is not a directory; skipping: $p2" >&2
+    return 1
+  fi
+  if [[ ! -d "$p1" && ! -d "$p2" ]]; then
+    echo "warning: project '$name': neither side exists; skipping" >&2
+    echo "  side 1: $p1" >&2
+    echo "  side 2: $p2" >&2
+    return 1
+  fi
+  if [[ -d "$p1" && ! -d "$p2" ]]; then
+    PROJECT_DIRS_TO_CREATE+=("$p2")
+    if [[ $DRY_RUN -eq 1 ]]; then
+      echo "note: project '$name': side 2 is missing (dry-run, not creating): $p2" >&2
+    else
+      echo "note: project '$name': side 2 is missing and will be created: $p2" >&2
+    fi
+  elif [[ -d "$p2" && ! -d "$p1" ]]; then
+    PROJECT_DIRS_TO_CREATE+=("$p1")
+    if [[ $DRY_RUN -eq 1 ]]; then
+      echo "note: project '$name': side 1 is missing (dry-run, not creating): $p1" >&2
+    else
+      echo "note: project '$name': side 1 is missing and will be created: $p1" >&2
+    fi
+  fi
+  return 0
+}
+
+activate_projects() {
+  local name
+  ACTIVE_PROJECTS=()
+  PROJECT_DIRS_TO_CREATE=()
+  [[ $DO_PROJECTS -eq 1 ]] || return 0
+  for name in "${PROJECT_ORDER[@]+"${PROJECT_ORDER[@]}"}"; do
+    if prepare_project_pair "$name"; then
+      ACTIVE_PROJECTS+=("$name")
+    fi
+  done
+}
+
+# Null-delimited files under one root for the given items (dirs recurse, files are exact).
+collect_scope_files() {
   local root="$1"
-  local sub
-  for sub in "${SYNC_SUBDIRS[@]}"; do
-    if [[ -d "$root/$sub" ]]; then
-      find "$root/$sub" -type f -print0 2>/dev/null
+  shift
+  local item sub
+  [[ -d "$root" ]] || return 0
+  for item in "$@"; do
+    if [[ "$item" == */ ]]; then
+      sub="${item%/}"
+      if [[ -d "$root/$sub" ]]; then
+        find "$root/$sub" -type f -print0 2>/dev/null
+      fi
+    elif [[ -f "$root/$item" ]]; then
+      printf '%s\0' "$root/$item"
     fi
   done
 }
 
-echo "Cursor root 1: $ROOT1"
-[[ "$ROOT1_CFG" != "$ROOT1" ]] && echo "  (from $ROOT1_CFG)"
-echo "Cursor root 2: $ROOT2"
-[[ "$ROOT2_CFG" != "$ROOT2" ]] && echo "  (from $ROOT2_CFG)"
-echo "Scope:        rules/ agents/ skills/"
-[[ $NORMALIZE_LF -eq 1 ]] && echo "Normalize:    LF strip on copy for .md/.mdc/.json/.yaml/.txt"
-[[ $DRY_RUN -eq 1 ]] && echo "Mode:         dry-run"
-maybe_warn_drvfs "$ROOT1" "root 1"
-maybe_warn_drvfs "$ROOT2" "root 2"
-echo "Scanning both roots for files under rules/, agents/, skills/ ..."
-echo
+index_pair() {
+  local root1="$1" root2="$2" prefix="$3"
+  shift 3
+  local -a items=("$@")
+  local -a found=()
+  local -A local_seen=()
+  local f rel logical
+  while IFS= read -r -d '' f; do
+    rel="${f#"$root1"/}"
+    if [[ -z "$rel" || "$rel" == "$f" ]]; then
+      continue
+    fi
+    if [[ -z "${local_seen[$rel]+x}" ]]; then
+      local_seen[$rel]=1
+      found+=("$rel")
+    fi
+  done < <(collect_scope_files "$root1" "${items[@]}")
+  while IFS= read -r -d '' f; do
+    rel="${f#"$root2"/}"
+    if [[ -z "$rel" || "$rel" == "$f" ]]; then
+      continue
+    fi
+    if [[ -z "${local_seen[$rel]+x}" ]]; then
+      local_seen[$rel]=1
+      found+=("$rel")
+    fi
+  done < <(collect_scope_files "$root2" "${items[@]}")
+  for rel in "${found[@]+"${found[@]}"}"; do
+    if [[ -n "$prefix" ]]; then
+      logical="$prefix/$rel"
+    else
+      logical="$rel"
+    fi
+    if [[ -z "${SEEN_PATHS[$logical]+x}" ]]; then
+      SEEN_PATHS[$logical]=1
+      PATHS+=("$logical")
+    fi
+    FILE_REL[$logical]="$rel"
+    FILE_ROOT1[$logical]="$root1"
+    FILE_ROOT2[$logical]="$root2"
+  done
+}
 
-declare -A SEEN_PATHS
+index_all_pairs() {
+  local name
+  if [[ $DO_GLOBAL -eq 1 ]]; then
+    index_pair "$ROOT1" "$ROOT2" "" "${GLOBAL_ITEMS[@]}"
+  fi
+  if [[ $DO_PROJECTS -eq 1 ]]; then
+    for name in "${ACTIVE_PROJECTS[@]+"${ACTIVE_PROJECTS[@]}"}"; do
+      index_pair "${PROJECT_PATH1[$name]}" "${PROJECT_PATH2[$name]}" "projects/$name" "${PROJECT_ITEMS[@]}"
+    done
+  fi
+}
+
+default_global_scope() {
+  [[ ${#GLOBAL_ITEMS[@]} -eq 3 && "${GLOBAL_ITEMS[0]}" == rules/ && "${GLOBAL_ITEMS[1]}" == agents/ && "${GLOBAL_ITEMS[2]}" == skills/ ]]
+}
+
+print_run_header() {
+  local name
+  echo "Cursor root 1: $ROOT1"
+  [[ "$ROOT1_CFG" != "$ROOT1" ]] && echo "  (from $ROOT1_CFG)"
+  echo "Cursor root 2: $ROOT2"
+  [[ "$ROOT2_CFG" != "$ROOT2" ]] && echo "  (from $ROOT2_CFG)"
+  if [[ $DO_GLOBAL -eq 1 ]]; then
+    echo "Scope:        ${GLOBAL_ITEMS[*]}"
+  else
+    echo "Scope:        projects only (--projects-only)"
+  fi
+  if [[ $DO_PROJECTS -eq 1 && ${#PROJECT_ORDER[@]} -gt 0 ]]; then
+    echo "Projects:     ${#ACTIVE_PROJECTS[@]} pair(s); items: ${PROJECT_ITEMS[*]}"
+    for name in "${ACTIVE_PROJECTS[@]+"${ACTIVE_PROJECTS[@]}"}"; do
+      echo "  $name: ${PROJECT_PATH1[$name]}  <->  ${PROJECT_PATH2[$name]}"
+    done
+  elif [[ $DO_PROJECTS -eq 0 && ${#PROJECT_ORDER[@]} -gt 0 ]]; then
+    echo "Projects:     skipped (--no-projects)"
+  fi
+  [[ $NORMALIZE_LF -eq 1 ]] && echo "Normalize:    LF strip on copy for .md/.mdc/.json/.yaml/.txt"
+  [[ $DRY_RUN -eq 1 ]] && echo "Mode:         dry-run"
+  maybe_warn_drvfs "$ROOT1" "root 1"
+  maybe_warn_drvfs "$ROOT2" "root 2"
+  if [[ $DO_PROJECTS -eq 1 ]]; then
+    for name in "${ACTIVE_PROJECTS[@]+"${ACTIVE_PROJECTS[@]}"}"; do
+      if [[ -d "${PROJECT_PATH1[$name]}" ]]; then
+        maybe_warn_drvfs "${PROJECT_PATH1[$name]}" "project $name side 1"
+      fi
+      if [[ -d "${PROJECT_PATH2[$name]}" ]]; then
+        maybe_warn_drvfs "${PROJECT_PATH2[$name]}" "project $name side 2"
+      fi
+    done
+  fi
+  if [[ $DO_GLOBAL -eq 0 ]]; then
+    echo "Scanning project pairs ..."
+  elif [[ $DO_PROJECTS -eq 1 && ${#ACTIVE_PROJECTS[@]} -gt 0 ]]; then
+    echo "Scanning global roots and project pairs ..."
+  elif default_global_scope; then
+    echo "Scanning both roots for files under rules/, agents/, skills/ ..."
+  else
+    echo "Scanning both roots for files under global scope (${GLOBAL_ITEMS[*]}) ..."
+  fi
+  echo
+}
+
+create_missing_project_dirs() {
+  local d
+  for d in "${PROJECT_DIRS_TO_CREATE[@]+"${PROJECT_DIRS_TO_CREATE[@]}"}"; do
+    if [[ $DRY_RUN -eq 1 ]]; then
+      echo "[dry-run] would create directory: $d"
+    else
+      mkdir -p -- "$d" || die "cannot create directory: $d"
+      echo "created directory: $d"
+    fi
+  done
+}
+
+configure_sync_scope
+activate_projects
+print_run_header
+
+declare -A SEEN_PATHS=()
 PATHS=()
-
-while IFS= read -r -d '' f; do
-  rel="${f#"$ROOT1"/}"
-  if [[ -n "$rel" && "$rel" != "$f" ]]; then
-    if [[ -z "${SEEN_PATHS[$rel]+x}" ]]; then
-      SEEN_PATHS[$rel]=1
-      PATHS+=("$rel")
-    fi
-  fi
-done < <(collect_relpaths "$ROOT1")
-
-while IFS= read -r -d '' f; do
-  rel="${f#"$ROOT2"/}"
-  if [[ -n "$rel" && "$rel" != "$f" ]]; then
-    if [[ -z "${SEEN_PATHS[$rel]+x}" ]]; then
-      SEEN_PATHS[$rel]=1
-      PATHS+=("$rel")
-    fi
-  fi
-done < <(collect_relpaths "$ROOT2")
+index_all_pairs
 
 PATHS_SORTED=()
 if ((${#PATHS[@]})); then
@@ -657,8 +1059,9 @@ resolve_conflict() {
 
 sync_one() {
   local rel="$1"
-  local root1_f="$ROOT1/$rel"
-  local root2_f="$ROOT2/$rel"
+  pair_paths "$rel"
+  local root1_f="$PP_R1"
+  local root2_f="$PP_R2"
 
   if [[ ! -f "$root1_f" && ! -f "$root2_f" ]]; then
     return 0
@@ -804,6 +1207,8 @@ sync_one() {
 
 ensure_pre_sync_consent_if_needed
 
+create_missing_project_dirs
+
 for rel in "${PATHS_SORTED[@]+"${PATHS_SORTED[@]}"}"; do
   sync_one "$rel"
 done
@@ -853,6 +1258,39 @@ Output ONLY a git commit message following Conventional Commits:
   return 1
 }
 
+git_add_sync_scope() {
+  local f item sub
+  for f in .gitignore .gitattributes; do
+    if [[ -f "$f" ]]; then
+      git add -- "$f"
+    fi
+  done
+  for item in "${GLOBAL_ITEMS[@]}"; do
+    if [[ "$item" == */ ]]; then
+      sub="${item%/}"
+      [[ -d "$sub" ]] || continue
+      # agents/ and skills/ may be ignored by a managed .gitignore; -f keeps them staged.
+      # Extra directories and files use -f for the same reason. rules/ stays a normal add.
+      if [[ "$sub" == rules ]]; then
+        git add -- "$sub"
+      else
+        git add -f -- "$sub"
+      fi
+    elif [[ -f "$item" ]]; then
+      git add -f -- "$item"
+    fi
+  done
+}
+
+git_reset_sync_scope() {
+  local item
+  local specs=(.gitignore .gitattributes)
+  for item in "${GLOBAL_ITEMS[@]}"; do
+    specs+=("${item%/}")
+  done
+  git reset HEAD -- "${specs[@]}" 2>/dev/null || true
+}
+
 git_preview_staged_diffs() {
   local root name
   for root in "$ROOT1" "$ROOT2"; do
@@ -872,23 +1310,9 @@ git_preview_staged_diffs() {
         exit 0
       fi
       normalize_lf_in_sync_scope
-      local f sub
-      for f in .gitignore .gitattributes; do
-        if [[ -f "$f" ]]; then
-          git add -- "$f"
-        fi
-      done
-      for sub in "${SYNC_SUBDIRS[@]}"; do
-        if [[ -d "$sub" ]]; then
-          if [[ "$sub" == agents || "$sub" == skills ]]; then
-            git add -f -- "$sub"
-          else
-            git add -- "$sub"
-          fi
-        fi
-      done
+      git_add_sync_scope
       if git diff --cached --quiet; then
-        echo "=== git preview ($name): nothing staged after add (rules, agents, skills, gitignore/attributes) ==="
+        echo "=== git preview ($name): nothing staged after add (${GIT_SCOPE_LABEL}) ==="
       else
         echo "=== git preview ($name): git diff --cached (same paths as commit) ==="
         if [[ -n "${SYNC_DIFF_PAGER:-}" ]]; then
@@ -897,7 +1321,7 @@ git_preview_staged_diffs() {
           git --no-pager diff --cached --color=auto || true
         fi
       fi
-      git reset HEAD -- .gitignore .gitattributes "${SYNC_SUBDIRS[@]}" 2>/dev/null || true
+      git_reset_sync_scope
     )
     echo
   done
@@ -916,24 +1340,9 @@ git_commit_push_one() {
       exit 0
     fi
     normalize_lf_in_sync_scope
-    for f in .gitignore .gitattributes; do
-      if [[ -f "$f" ]]; then
-        git add -- "$f"
-      fi
-    done
-    local sub
-    for sub in "${SYNC_SUBDIRS[@]}"; do
-      if [[ -d "$sub" ]]; then
-        # agents/ and skills/ may be ignored by a managed .gitignore; -f keeps them staged.
-        if [[ "$sub" == agents || "$sub" == skills ]]; then
-          git add -f -- "$sub"
-        else
-          git add -- "$sub"
-        fi
-      fi
-    done
+    git_add_sync_scope
     if git diff --cached --quiet; then
-      echo "git ($name): nothing to commit (rules, agents, skills, gitignore/attributes)"
+      echo "git ($name): nothing to commit (${GIT_SCOPE_LABEL})"
       exit 0
     fi
     local msg="$COMMIT_MSG"
@@ -963,6 +1372,11 @@ git_commit_push_one() {
   )
 }
 
+if [[ $COMMIT_PUSH -eq 1 && $DO_GLOBAL -eq 0 ]]; then
+  echo "note: --commit-push applies to the global roots only; skipped with --projects-only" >&2
+  COMMIT_PUSH=0
+fi
+
 if [[ $COMMIT_PUSH -eq 1 ]]; then
   if [[ $DRY_RUN -eq 0 ]] && [[ $ASSUME_YES -eq 0 ]]; then
     if ! confirm_default_yes_with_diff 'Proceed with git commit and push? [Y/n/d]' git_preview_staged_diffs; then
@@ -974,7 +1388,7 @@ fi
 
 if [[ $COMMIT_PUSH -eq 1 ]] && [[ $SKIP_GIT_COMMIT_PUSH -eq 0 ]]; then
   echo
-  echo "=== git commit/push (rules, agents, skills, gitignore/attributes) ==="
+  echo "=== git commit/push (${GIT_SCOPE_LABEL}) ==="
   git_commit_push_one "$ROOT1" "root 1" || true
   git_commit_push_one "$ROOT2" "root 2" || true
 fi
